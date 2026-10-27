@@ -1,0 +1,13 @@
+function Timeline({events,max=40,compact}){if(!events.length)return <Empty icon="list" title="No activity yet" body="Events for this item will appear here."/>;
+ return <div className="tl">{events.slice(0,max).map(e=><div key={e.id} className="tli"><div className="tlt num">{hm(e.ts)}</div><div className="tld" style={{background:e.type==='SLA breached'||e.type==='Safety rule applied'?'#c13515':e.type==='Human override'?'#a8430a':KIND_C[e.kind]}}></div><div className="col" style={{gap:2,minWidth:0}}><div style={{fontWeight:500}}>{e.action}</div><div className="small muted">{e.actor}{e.room&&!compact?` · Room ${e.room}`:''}{e.result?` · ${e.result}`:''}</div></div></div>)}</div>}
+
+function AIPanel({t,editable=true}){
+ const [ov,setOv]=useState(false);const [sev,setSev]=useState(t.severity);const [cat,setCat]=useState(t.category);
+ const tech=S.staff[t.assignee];
+ return <Panel title={<span className="row g8"><Icon n="bolt" s={16}/>AI decision</span>} sub={`Maintenance Agent · ${hm(t.created)}`} right={t.fallback?<Pill tone="warn" icon="cloudoff">Fallback</Pill>:t.needsReview?<Pill tone="warn">Needs human review</Pill>:<Pill tone="muted">Confidence: {t.conf}</Pill>}>
+  <div className="col g16">
+   {t.fallback&&!t.forced&&<div className="alert warn"><Icon n="cloudoff" s={18}/><div>AI classification is temporarily unavailable. A default priority has been applied and the issue has been queued for review.</div></div>}
+   <div className="aigrid">
+    <div className="k">Category</div><div className="col g4"><div style={{fontSize:18,fontWeight:600}}>{t.category}</div><div className="small" style={{color:'var(--color-body)'}}><b>Because</b> {t.why}</div></div>
+    <div className="k">Severity</div><div className="col g4"><div><Prio p={t.severity}/></div><div className="small" style={{color:'var(--color-body)'}}><b>Reason</b> {t.sevWhy}</div>
+     {t.forced&&<div className="alert crit small" style={{marginTop:4}}><Icon n="shield" s={16}/><div><b>Safety rule applied.</b> {t.aiSever

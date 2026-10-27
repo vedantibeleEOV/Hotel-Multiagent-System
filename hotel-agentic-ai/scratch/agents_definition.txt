@@ -1,0 +1,24 @@
+S.agents={
+ orch:{id:'orch',name:'Orchestrator',desc:'Receives events and routes work to the right agent',processed:412,success:99.8,last:'Routed checkout · Room 116 to Room Readiness',lastTs:T0-40000,current:null},
+ rr:{id:'rr',name:'Room Readiness',desc:'Detects checkouts, sets room status and cleaning urgency',processed:96,success:100,last:'Marked Room 520 DIRTY (High)',lastTs:T0-9*MIN,current:null},
+ hk:{id:'hk',name:'Housekeeping',desc:'Matches attendants to rooms and tracks cleaning',processed:143,success:97.9,last:'Assigned Lata Chavan to Room 520',lastTs:T0-8*MIN,current:null},
+ mt:{id:'mt',name:'Maintenance',desc:'Classifies issues, sets severity and SLA, finds technicians',processed:38,success:94.7,last:'Assigned Vikram Rane to Room 305',lastTs:T0-4*MIN,current:null},
+};
+
+// ---------- rooms
+for(let f=1;f<=5;f++)for(let n=1;n<=20;n++){
+ const id=`${f}${String(n).padStart(2,'0')}`,type=typeOf(n),x=rnd();
+ const status=x<.6?'Occupied':x<.69?'Dirty':x<.75?'Cleaning':x<.79?'Clean':'Ready';
+ const r={id,floor:f,type,status,guest:null,vip:false,dueOut:false,arrival:null,note:null};
+ if(status==='Occupied'){r.guest=GUESTS[Math.floor(rnd()*GUESTS.length)];r.dueOut=rnd()<.28;r.vip=type==='Suite'&&rnd()<.5}
+ if(status!=='Occupied'&&rnd()<.72)r.arrival={name:GUESTS[Math.floor(rnd()*GUESTS.length)],ts:T0+Math.round(40+rnd()*380)*MIN,vip:type==='Suite'||rnd()<.12};
+ S.rooms[id]=r;
+}
+const ov=(id,p)=>Object.assign(S.rooms[id],p);
+ov('101',{status:'Occupied',guest:'Rohan Mehta',dueOut:true,arrival:{name:'Kavya Reddy',ts:T0+150*MIN,vip:false}});
+ov('107',{status:'Dirty',guest:null,arrival:{name:'Sara Iyer',ts:T0+170*MIN,vip:false}});
+ov('112',{status:'Dirty',guest:null,arrival:null});
+ov('116',{status:'Occupied',guest:'Omar Haddad',dueOut:false});
+ov('118',{status:'Cleaning',guest:null,arrival:{name:'Emily Clarke',ts:T0+55*MIN,vip:false}});
+ov('204',{status:'Occupied',guest:'Anita Rao',dueOut:false,vip:false});
+ov('215',{status:'Maintenance',guest:null,arrival:null,note:'

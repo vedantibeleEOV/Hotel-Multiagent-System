@@ -1,0 +1,5997 @@
+import sys
+from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
+
+# Ensure project root is in sys.path when script is executed directly
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from sqlalchemy import and_, Date, cast, desc, func, or_, select
+
+from app.config import settings
+from app.database.connection import SessionLocal
+from app.database.orm import (
+    GuestEntity,
+    HotelPolicyEntity,
+    MaintenanceIncidentEntity,
+    OperationalTaskEntity,
+    ReservationEntity,
+    RoomEntity,
+    StaffEntity,
+    TaskActivityEntity,
+)
+from app.models.enums import (
+    GuestType,
+    IncidentStatus,
+    MaintenanceCategory,
+    MaintenanceSeverity,
+    MaintenanceSkill,
+    RoomStatus,
+    StaffRole,
+    TaskStatus,
+    TaskType,
+)
+from app.models.guest import Guest
+from app.models.hotel_policy import HotelPolicy
+from app.models.maintenance_incident import MaintenanceIncident
+from app.models.operational_task import OperationalTask
+from app.models.reservation import Reservation
+from app.models.room import Room
+from app.models.staff import Staff
+
+# ASSUMPTION: Standard estimated cleaning durations in minutes by room type.
+# DELUXE = 45, STANDARD = 30, SUITE = 50. Fallback = 30.
+DEFAULT_CLEANING_MINUTES_BY_ROOM_TYPE = {
+    "DELUXE": 45,
+    "STANDARD": 30,
+    "SUITE": 50,
+}
+DEFAULT_CLEANING_MINUTES_FALLBACK = 30
+
+
+class PostgresHotelRepository:
+    """PostgreSQL implementation of hotel data repository for READ and WRITE operations using SQLAlchemy 2.x."""
+
+
+    def __init__(self, session_factory=SessionLocal):
+        self.session_factory = session_factory
+
+    @staticmethod
+    def _to_pydantic_incident(entity: MaintenanceIncidentEntity) -> MaintenanceIncident:
+        created_dt = entity.created_at
+        if created_dt and created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+        resolved_dt = entity.resolved_at
+        if resolved_dt and resolved_dt.tzinfo is None:
+            resolved_dt = resolved_dt.replace(tzinfo=timezone.utc)
+        return MaintenanceIncident(
+            id=entity.id,
+            room_id=entity.room_id,
+            reported_by_staff_id=entity.reported_by_staff_id,
+            description=entity.description,
+            category=MaintenanceCategory(entity.category),
+            severity=MaintenanceSeverity(entity.severity),
+            affects_room_readiness=entity.affects_room_readiness,
+            status=IncidentStatus(entity.status),
+            assigned_technician_id=entity.assigned_technician_id,
+            sla_minutes=entity.sla_minutes,
+            created_at=created_dt,
+            operational_task_id=entity.operational_task_id,
+            category_reason=entity.category_reason,
+            severity_reason=entity.severity_reason,
+            confidence_score=entity.confidence_score,
+            decision_source=entity.decision_source or "RULE_TABLE",
+            safety_rule_applied=entity.safety_rule_applied or False,
+            safety_rule_text=entity.safety_rule_text,
+            technician_match_reason=entity.technician_match_reason,
+            is_fallback=entity.is_fallback or False,
+            needs_human_review=entity.needs_human_review or False,
+            resolved_at=resolved_dt,
+            original_ai_decision=entity.original_ai_decision,
+            blocks_housekeeping=entity.blocks_housekeeping,
+            housekeeping_hold_reason=entity.housekeeping_hold_reason,
+        )
+
+
+    @staticmethod
+    def _to_pydantic_room(
+        entity: RoomEntity,
+        open_issue_category: Optional[str] = None,
+        current_reservation_id: Optional[int] = None,
+    ) -> Room:
+        return Room(
+            id=entity.id,
+            property_id=entity.property_id,
+            room_number=entity.room_number,
+            floor=entity.floor,
+            room_type=entity.room_type or "",
+            status=RoomStatus(entity.status) if entity.status else RoomStatus.DIRTY,
+            open_issue_category=open_issue_category,
+            current_reservation_id=current_reservation_id,
+        )
+
+    @staticmethod
+    def _to_pydantic_guest(entity: GuestEntity) -> Guest:
+        return Guest(
+            id=entity.id,
+            first_name=entity.first_name,
+            last_name=entity.last_name,
+            guest_type=GuestType(entity.guest_type) if entity.guest_type else GuestType.REGULAR,
+        )
+
+    @staticmethod
+    def _to_pydantic_reservation(entity: ReservationEntity) -> Reservation:
+        return Reservation(
+            id=entity.id,
+            guest_id=entity.guest_id,
+            room_id=entity.room_id,
+            check_in_time=entity.check_in_time,
+            check_out_time=entity.check_out_time,
+            early_check_in_requested=entity.early_check_in_requested,
+        )
+
+    @staticmethod
+    def _to_pydantic_staff(entity: StaffEntity) -> Staff:
+        skills_raw = entity.skills
+        skills = []
+        if isinstance(skills_raw, list):
+            for sk in skills_raw:
+                try:
+                    skills.append(MaintenanceSkill(str(sk).upper()))
+                except ValueError:
+                    skills.append(sk)
+        elif entity.id == 301:
+            skills = [MaintenanceSkill.HVAC, MaintenanceSkill.GENERAL]
+        elif entity.id == 302:
+            skills = [MaintenanceSkill.ELECTRICAL, MaintenanceSkill.PLUMBING, MaintenanceSkill.GENERAL]
+        elif entity.id == 303:
+            skills = [MaintenanceSkill.PLUMBING, MaintenanceSkill.GENERAL]
+
+        avail_status = entity.availability_status or ("AVAILABLE" if entity.is_available else "BUSY")
+        return Staff(
+            id=entity.id,
+            name=entity.name,
+            role=StaffRole(entity.role) if entity.role else StaffRole.HOUSEKEEPING,
+            assigned_floor=entity.assigned_floor,
+            assigned_room_id=entity.assigned_room_id,
+            is_available=entity.is_available,
+            active_task_count=entity.active_task_count,
+            skills=skills,
+            availability_status=avail_status,
+            availability_note=entity.availability_note,
+        )
+
+
+    @staticmethod
+    def _to_pydantic_task(entity: OperationalTaskEntity) -> OperationalTask:
+        created_dt = entity.created_at
+        if created_dt and created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+        started_dt = entity.started_at
+        if started_dt and started_dt.tzinfo is None:
+            started_dt = started_dt.replace(tzinfo=timezone.utc)
+        return OperationalTask(
+            id=entity.id,
+            room_id=entity.room_id,
+            task_type=TaskType(entity.task_type),
+            priority_score=entity.priority_score,
+            priority_level=entity.priority_level,
+            status=TaskStatus(entity.status),
+            assigned_staff_id=entity.assigned_staff_id,
+            created_at=created_dt,
+            started_at=started_dt,
+            notes=entity.notes,
+        )
+
+    def get_rooms(
+        self,
+        floor: Optional[int] = None,
+        status: Optional[Union[str, RoomStatus]] = None,
+        room_type: Optional[str] = None,
+    ) -> List[Room]:
+        """Read rooms with optional filtering by floor, status, room_type, sorted by room_number."""
+        with self.session_factory() as session:
+            stmt = select(RoomEntity)
+            if floor is not None:
+                stmt = stmt.where(RoomEntity.floor == floor)
+            if status is not None:
+                status_val = status.value if hasattr(status, "value") else str(status)
+                stmt = stmt.where(RoomEntity.status == status_val.upper())
+            if room_type is not None:
+                stmt = stmt.where(RoomEntity.room_type == room_type.upper())
+            stmt = stmt.order_by(RoomEntity.room_number.asc())
+            entities = session.execute(stmt).scalars().all()
+
+            # Query open maintenance incidents mapped by room_id
+            inc_stmt = (
+                select(MaintenanceIncidentEntity.room_id, MaintenanceIncidentEntity.category)
+                .where(MaintenanceIncidentEntity.status != "RESOLVED")
+                .order_by(MaintenanceIncidentEntity.created_at.desc())
+            )
+            open_incs = session.execute(inc_stmt).all()
+            open_cat_by_room = {}
+            for r_id, cat in open_incs:
+                if r_id not in open_cat_by_room and cat:
+                    open_cat_by_room[r_id] = cat
+
+            # Query active/checked-in reservations for occupied rooms
+            now_utc = datetime.now(timezone.utc)
+            res_stmt = (
+                select(ReservationEntity)
+                .order_by(ReservationEntity.check_out_time.desc(), ReservationEntity.id.desc())
+            )
+            all_reservations = session.execute(res_stmt).scalars().all()
+            res_by_room = {}
+            for r in all_reservations:
+                res_by_room.setdefault(r.room_id, []).append(r)
+
+            active_res_by_room = {}
+            for r_id, r_list in res_by_room.items():
+                match = next(
+                    (
+                        res.id
+                        for res in r_list
+                        if res.check_in_time
+                        and res.check_out_time
+                        and (res.check_in_time <= now_utc <= res.check_out_time)
+                    ),
+                    None,
+                )
+                active_res_by_room[r_id] = match or (r_list[0].id if r_list else None)
+
+            return [
+                self._to_pydantic_room(
+                    e,
+                    open_issue_category=open_cat_by_room.get(e.id),
+                    current_reservation_id=active_res_by_room.get(e.id) if (e.status == "OCCUPIED") else None,
+                )
+                for e in entities
+            ]
+
+    def get_rooms_summary(self) -> dict:
+        """Calculate total, status counts, and floor counts using SQL aggregation."""
+        with self.session_factory() as session:
+            total = session.scalar(select(func.count(RoomEntity.id))) or 0
+
+            # Real SQL GROUP BY query for status
+            status_stmt = select(RoomEntity.status, func.count(RoomEntity.id)).group_by(RoomEntity.status)
+            status_rows = session.execute(status_stmt).all()
+            by_status = {s.value: 0 for s in RoomStatus}
+            for st, cnt in status_rows:
+                if st:
+                    by_status[st] = cnt
+
+            # Real SQL GROUP BY query for floor
+            floor_stmt = (
+                select(RoomEntity.floor, func.count(RoomEntity.id))
+                .group_by(RoomEntity.floor)
+                .order_by(RoomEntity.floor.asc())
+            )
+            floor_rows = session.execute(floor_stmt).all()
+            by_floor = {str(fl): cnt for fl, cnt in floor_rows if fl is not None}
+
+            # Real SQL GROUP BY query for floor and status
+            floor_status_stmt = (
+                select(RoomEntity.floor, RoomEntity.status, func.count(RoomEntity.id))
+                .group_by(RoomEntity.floor, RoomEntity.status)
+                .order_by(RoomEntity.floor.asc())
+            )
+            floor_status_rows = session.execute(floor_status_stmt).all()
+
+            by_floor_status = {
+                fl_key: {s.value: 0 for s in RoomStatus}
+                for fl_key in by_floor.keys()
+            }
+            for fl, st, cnt in floor_status_rows:
+                if fl is not None and st is not None:
+                    fl_key = str(fl)
+                    if fl_key not in by_floor_status:
+                        by_floor_status[fl_key] = {s.value: 0 for s in RoomStatus}
+                    by_floor_status[fl_key][st] = cnt
+
+            return {
+                "total": total,
+                "by_status": by_status,
+                "by_floor": by_floor,
+                "by_floor_status": by_floor_status,
+            }
+
+    def get_room_by_id(self, room_id: int) -> Optional[Room]:
+        """Read a room from PostgreSQL by ID and return Pydantic Room model."""
+        with self.session_factory() as session:
+            entity = session.get(RoomEntity, room_id)
+            if not entity:
+                return None
+            inc_stmt = (
+                select(MaintenanceIncidentEntity.category)
+                .where(MaintenanceIncidentEntity.room_id == room_id, MaintenanceIncidentEntity.status != "RESOLVED")
+                .order_by(MaintenanceIncidentEntity.created_at.desc())
+            )
+            open_cat = session.scalar(inc_stmt)
+            curr_res_id = None
+            if entity.status == "OCCUPIED":
+                now_utc = datetime.now(timezone.utc)
+                res_stmt = (
+                    select(ReservationEntity)
+                    .where(ReservationEntity.room_id == room_id)
+                    .order_by(ReservationEntity.check_out_time.desc(), ReservationEntity.id.desc())
+                )
+                room_reservations = session.execute(res_stmt).scalars().all()
+                if room_reservations:
+                    match = next(
+                        (
+                            res.id
+                            for res in room_reservations
+                            if res.check_in_time
+                            and res.check_out_time
+                            and (res.check_in_time <= now_utc <= res.check_out_time)
+                        ),
+                        None,
+                    )
+                    curr_res_id = match or room_reservations[0].id
+
+            return self._to_pydantic_room(entity, open_issue_category=open_cat, current_reservation_id=curr_res_id)
+
+    def get_guest_by_id(self, guest_id: int) -> Optional[Guest]:
+        """Read a guest from PostgreSQL by ID and return Pydantic Guest model."""
+        with self.session_factory() as session:
+            entity = session.get(GuestEntity, guest_id)
+            return self._to_pydantic_guest(entity) if entity else None
+
+    def get_staff_by_id(self, staff_id: int) -> Optional[Staff]:
+        """Read a staff member from PostgreSQL by ID and return Pydantic Staff model."""
+        with self.session_factory() as session:
+            entity = session.get(StaffEntity, staff_id)
+            return self._to_pydantic_staff(entity) if entity else None
+
+    def get_all_staff(self, role: Optional[str] = None) -> List[Staff]:
+        """Read all staff members from PostgreSQL with optional role filter."""
+        with self.session_factory() as session:
+            stmt = select(StaffEntity)
+            if role:
+                stmt = stmt.where(StaffEntity.role == role.upper())
+            stmt = stmt.order_by(StaffEntity.id.asc())
+            entities = session.execute(stmt).scalars().all()
+            return [self._to_pydantic_staff(e) for e in entities]
+
+    def get_reservation_by_id(self, reservation_id: int) -> Optional[Reservation]:
+
+        """Read a reservation from PostgreSQL by ID and return Pydantic Reservation model."""
+        with self.session_factory() as session:
+            entity = session.get(ReservationEntity, reservation_id)
+            return self._to_pydantic_reservation(entity) if entity else None
+
+    def get_next_reservation_for_room(
+        self, room_id: int, after_time: datetime
+    ) -> Optional[Reservation]:
+        """Find earliest reservation for room_id after given after_time."""
+        after_time_aware = (
+            after_time.replace(tzinfo=timezone.utc) if after_time.tzinfo is None else after_time
+        )
+        with self.session_factory() as session:
+            stmt = (
+                select(ReservationEntity)
+                .where(
+                    ReservationEntity.room_id == room_id,
+                    ReservationEntity.check_in_time > after_time_aware,
+                )
+                .order_by(ReservationEntity.check_in_time.asc())
+                .limit(1)
+            )
+            entity = session.execute(stmt).scalar_one_or_none()
+            return self._to_pydantic_reservation(entity) if entity else None
+
+    def get_room_status(self, room_id: int) -> Optional[str]:
+        """Return the current string status of a room (e.g. 'READY', 'OCCUPIED', 'DIRTY') or None if not found."""
+        with self.session_factory() as session:
+            entity = session.get(RoomEntity, room_id)
+            if not entity:
+                return None
+            return entity.status.value if hasattr(entity.status, "value") else str(entity.status)
+
+    def get_current_occupant_reservation(
+        self, room_id: int, exclude_reservation_id: Optional[int] = None
+    ) -> Optional[dict]:
+        """Return the reservation currently occupying the room, including its check_out_time, or None.
+
+        If exclude_reservation_id is provided, skips that reservation (e.g. the incoming guest's own booking).
+        """
+        now_utc = datetime.now(timezone.utc)
+        with self.session_factory() as session:
+            room = session.get(RoomEntity, room_id)
+            if not room:
+                return None
+
+            stmt = (
+                select(ReservationEntity)
+                .where(
+                    ReservationEntity.room_id == room_id,
+                    ReservationEntity.check_in_time <= now_utc,
+                    ReservationEntity.check_out_time >= now_utc,
+                )
+            )
+            if exclude_reservation_id is not None:
+                stmt = stmt.where(ReservationEntity.id != exclude_reservation_id)
+
+            stmt = stmt.order_by(ReservationEntity.check_out_time.desc()).limit(1)
+            res = session.execute(stmt).scalar_one_or_none()
+
+            # Fallback for OCCUPIED room where current time is near check_out_time or latest active stay
+            if not res and str(room.status).upper() == "OCCUPIED":
+                fallback_stmt = (
+                    select(ReservationEntity)
+                    .where(ReservationEntity.room_id == room_id)
+                )
+                if exclude_reservation_id is not None:
+                    fallback_stmt = fallback_stmt.where(ReservationEntity.id != exclude_reservation_id)
+                fallback_stmt = fallback_stmt.order_by(
+                    ReservationEntity.check_out_time.desc(), ReservationEntity.id.desc()
+                ).limit(1)
+                res = session.execute(fallback_stmt).scalar_one_or_none()
+
+            if not res:
+                return None
+
+            return {
+                "id": res.id,
+                "guest_id": res.guest_id,
+                "room_id": res.room_id,
+                "check_in_time": res.check_in_time,
+                "check_out_time": res.check_out_time,
+                "early_check_in_requested": res.early_check_in_requested,
+            }
+
+    def set_reservation_early_checkin(self, reservation_id: int) -> bool:
+        """Set early_check_in_requested=True on the specified reservation."""
+        with self.session_factory() as session:
+            entity = session.get(ReservationEntity, reservation_id)
+            if not entity:
+                return False
+            entity.early_check_in_requested = True
+            session.commit()
+            return True
+
+    def get_cleaning_eta(self, room_id: int) -> Optional[dict]:
+        """Return the active ROOM_CLEANING task status and estimated finish time, or None if no active cleaning task.
+
+        Job duration is determined by DEFAULT_CLEANING_MINUTES_BY_ROOM_TYPE (DELUXE: 45m, STANDARD: 30m, SUITE: 50m).
+        """
+        now_utc = datetime.now(timezone.utc)
+        with self.session_factory() as session:
+            room = session.get(RoomEntity, room_id)
+            if not room:
+                return None
+
+            room_type = (room.room_type or "").upper()
+            duration_minutes = DEFAULT_CLEANING_MINUTES_BY_ROOM_TYPE.get(
+                room_type, DEFAULT_CLEANING_MINUTES_FALLBACK
+            )
+
+            stmt = (
+                select(OperationalTaskEntity)
+                .where(
+                    OperationalTaskEntity.room_id == room_id,
+                    OperationalTaskEntity.task_type.in_(["ROOM_CLEANING", TaskType.ROOM_CLEANING.value]),
+                    OperationalTaskEntity.status.in_([
+                        TaskStatus.PENDING.value,
+                        TaskStatus.ASSIGNED.value,
+                        TaskStatus.IN_PROGRESS.value,
+                        TaskStatus.ON_HOLD.value,
+                        "PENDING",
+                        "ASSIGNED",
+                        "IN_PROGRESS",
+                        "ON_HOLD",
+                    ]),
+                )
+                .order_by(OperationalTaskEntity.created_at.desc())
+                .limit(1)
+            )
+            task = session.execute(stmt).scalar_one_or_none()
+            if not task:
+                return None
+
+            started_dt = task.started_at
+            if started_dt:
+                if started_dt.tzinfo is None:
+                    started_dt = started_dt.replace(tzinfo=timezone.utc)
+                finish_time = started_dt + timedelta(minutes=duration_minutes)
+            else:
+                finish_time = now_utc + timedelta(minutes=duration_minutes)
+
+            if finish_time < now_utc:
+                finish_time = now_utc + timedelta(minutes=5)
+
+            return {
+                "task_id": str(task.id),
+                "task_type": task.task_type,
+                "status": task.status,
+                "room_type": room.room_type,
+                "duration_minutes": duration_minutes,
+                "started_at": started_dt,
+                "estimated_finish_time": finish_time,
+            }
+
+    def get_maintenance_blockers(self, room_id: int) -> list[dict]:
+        """Return all open maintenance incidents for a room that block housekeeping or room readiness."""
+        with self.session_factory() as session:
+            stmt = (
+                select(MaintenanceIncidentEntity)
+                .where(
+                    MaintenanceIncidentEntity.room_id == room_id,
+                    MaintenanceIncidentEntity.status != "RESOLVED",
+                    MaintenanceIncidentEntity.status != IncidentStatus.RESOLVED.value,
+                    or_(
+                        MaintenanceIncidentEntity.blocks_housekeeping == True,
+                        MaintenanceIncidentEntity.affects_room_readiness == True,
+                    ),
+                )
+                .order_by(MaintenanceIncidentEntity.created_at.desc())
+            )
+            entities = session.execute(stmt).scalars().all()
+            return [
+                {
+                    "id": str(e.id),
+                    "room_id": e.room_id,
+                    "category": e.category,
+                    "severity": e.severity,
+                    "description": e.description,
+                    "status": e.status,
+                    "blocks_housekeeping": e.blocks_housekeeping,
+                    "housekeeping_hold_reason": e.housekeeping_hold_reason,
+                    "affects_room_readiness": e.affects_room_readiness,
+                }
+                for e in entities
+            ]
+
+    def is_vip_guest(self, guest_id: int) -> bool:
+        """Check whether a guest has VIP status."""
+        with self.session_factory() as session:
+            guest = session.get(GuestEntity, guest_id)
+            if not guest:
+                return False
+            gtype = guest.guest_type.value if hasattr(guest.guest_type, "value") else str(guest.guest_type)
+            return gtype.upper() == GuestType.VIP.value
+
+    def get_reservation_for_guest_room(
+        self,
+        guest_id: Optional[int] = None,
+        room_number: Optional[str] = None,
+        room_id: Optional[int] = None,
+        date: Optional[Union[datetime, str, Any]] = None,
+    ) -> Optional[dict]:
+        """Find a reservation for a guest ID or room number on a specific date (or nearest active reservation)."""
+        from datetime import date as date_type
+        with self.session_factory() as session:
+            target_room_id = room_id
+            if room_number is not None and target_room_id is None:
+                r_ent = session.execute(
+                    select(RoomEntity)
+                    .where(RoomEntity.room_number == str(room_number))
+                    .order_by(RoomEntity.id.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if r_ent:
+                    target_room_id = r_ent.id
+                else:
+                    return None
+
+            stmt = select(ReservationEntity)
+            if guest_id is not None:
+                stmt = stmt.where(ReservationEntity.guest_id == guest_id)
+            if target_room_id is not None:
+                stmt = stmt.where(ReservationEntity.room_id == target_room_id)
+
+            if date is not None:
+                if isinstance(date, str):
+                    try:
+                        target_d = date_type.fromisoformat(date.split("T")[0])
+                    except Exception:
+                        target_d = None
+                elif isinstance(date, datetime):
+                    target_d = date.date()
+                elif isinstance(date, date_type):
+                    target_d = date
+                else:
+                    target_d = None
+
+                if target_d:
+                    t_start = datetime.combine(target_d, time.min, tzinfo=timezone.utc)
+                    t_end = datetime.combine(target_d, time.max, tzinfo=timezone.utc)
+                    stmt = stmt.where(
+                        or_(
+                            cast(ReservationEntity.check_in_time, Date) == target_d,
+                            and_(
+                                ReservationEntity.check_in_time <= t_end,
+                                ReservationEntity.check_out_time >= t_start,
+                            ),
+                        )
+                    )
+
+            stmt = stmt.order_by(ReservationEntity.check_in_time.desc()).limit(1)
+            res = session.execute(stmt).scalar_one_or_none()
+            if not res:
+                return None
+
+            room_obj = session.get(RoomEntity, res.room_id)
+            return {
+                "id": res.id,
+                "guest_id": res.guest_id,
+                "room_id": res.room_id,
+                "room_number": room_obj.room_number if room_obj else None,
+                "check_in_time": res.check_in_time,
+                "check_out_time": res.check_out_time,
+                "early_check_in_requested": res.early_check_in_requested,
+            }
+
+    def get_hotel_policy(self) -> HotelPolicy:
+        """Fetch current hotel operational policy from hotel_policy table or fallback defaults."""
+        with self.session_factory() as session:
+            entity = session.execute(
+                select(HotelPolicyEntity).where(HotelPolicyEntity.policy_name == "DEFAULT")
+            ).scalar_one_or_none()
+            if entity:
+                return HotelPolicy(
+                    id=entity.id,
+                    policy_name=entity.policy_name,
+                    standard_check_in_time=entity.standard_check_in_time,
+                    standard_check_out_time=entity.standard_check_out_time,
+                    earliest_early_check_in=entity.earliest_early_check_in,
+                    early_check_in_requires_ready_room=entity.early_check_in_requires_ready_room,
+                    vip_priority=entity.vip_priority,
+                    created_at=entity.created_at,
+                    updated_at=entity.updated_at,
+                )
+            return HotelPolicy()
+
+    def get_available_housekeeping_staff(self, room_floor: int) -> List[Staff]:
+        """Return available housekeeping staff sorted by floor match, lowest workload, and ID."""
+        with self.session_factory() as session:
+            stmt = select(StaffEntity).where(
+                StaffEntity.role == StaffRole.HOUSEKEEPING.value,
+                StaffEntity.is_available == True,
+            )
+            staff_entities = list(session.execute(stmt).scalars().all())
+
+            staff_entities.sort(
+                key=lambda s: (
+                    0 if s.assigned_floor == room_floor else 1,
+                    s.active_task_count,
+                    s.id,
+                )
+            )
+            return [self._to_pydantic_staff(s) for s in staff_entities]
+
+    def get_active_room_housekeeper(
+        self, room_id: int, max_active_tasks: Optional[int] = None
+    ) -> Optional[Staff]:
+        """Look for an active GUEST_REQUEST task (ASSIGNED or IN_PROGRESS) for the same room.
+
+        If that housekeeper is still on duty (not offline, not on leave) and under the active task cap, return them.
+        """
+        if max_active_tasks is None:
+            from app.config import settings
+            max_active_tasks = getattr(settings, "MAX_HOUSEKEEPER_ACTIVE_TASKS", 5)
+
+        with self.session_factory() as session:
+            stmt = (
+                select(OperationalTaskEntity)
+                .where(
+                    OperationalTaskEntity.room_id == room_id,
+                    OperationalTaskEntity.task_type.in_([
+                        TaskType.GUEST_REQUEST.value,
+                        "GUEST_REQUEST",
+                    ]),
+                    OperationalTaskEntity.status.in_([
+                        TaskStatus.ASSIGNED.value,
+                        TaskStatus.IN_PROGRESS.value,
+                        "ASSIGNED",
+                        "IN_PROGRESS",
+                    ]),
+                    OperationalTaskEntity.assigned_staff_id.isnot(None),
+                )
+                .order_by(
+                    OperationalTaskEntity.created_at.desc(),
+                    OperationalTaskEntity.id.desc(),
+                )
+            )
+            tasks = list(session.execute(stmt).scalars().all())
+            for task_ent in tasks:
+                staff_ent = session.get(StaffEntity, task_ent.assigned_staff_id)
+                if not staff_ent:
+                    continue
+                role = str(getattr(staff_ent, "role", "")).upper()
+                if role not in (StaffRole.HOUSEKEEPING.value, "HOUSEKEEPING"):
+                    continue
+                avail_status = str(getattr(staff_ent, "availability_status", "AVAILABLE")).upper()
+                if avail_status in ("ON_LEAVE", "OFFLINE"):
+                    continue
+                active_count = getattr(staff_ent, "active_task_count", 0) or 0
+                if active_count >= max_active_tasks:
+                    continue
+                return self._to_pydantic_staff(staff_ent)
+            return None
+
+    def _assign_on_hold_guest_requests_in_session(self, session) -> List[OperationalTaskEntity]:
+        """Find ON_HOLD GUEST_REQUEST tasks, oldest first, and assign each to a cleaner.
+
+        First checks for an active housekeeper already working on the same room (not offline, not on leave,
+        and under active task cap). If none or unavailable, uses the existing rule (same floor, lowest workload).
+        Stops when no cleaner is free for unassigned tasks. Keeps room status OCCUPIED as today.
+        """
+        session.flush()
+        on_hold_stmt = (
+            select(OperationalTaskEntity)
+            .where(
+                OperationalTaskEntity.task_type.in_([
+                    TaskType.GUEST_REQUEST.value,
+                    "GUEST_REQUEST",
+                ]),
+                OperationalTaskEntity.status.in_([
+                    TaskStatus.ON_HOLD.value,
+                    "ON_HOLD",
+                ]),
+            )
+            .order_by(
+                OperationalTaskEntity.created_at.asc(),
+                OperationalTaskEntity.id.asc(),
+            )
+        )
+        on_hold_tasks = list(session.execute(on_hold_stmt).scalars().all())
+        if not on_hold_tasks:
+            return []
+
+        from app.config import settings
+        max_active_tasks = getattr(settings, "MAX_HOUSEKEEPER_ACTIVE_TASKS", 5)
+
+        assigned_tasks = []
+        now_utc = datetime.now(timezone.utc)
+
+        for task_ent in on_hold_tasks:
+            room_ent = session.get(RoomEntity, task_ent.room_id)
+            room_floor = room_ent.floor if room_ent else 1
+            room_num = room_ent.room_number if room_ent else task_ent.room_id
+
+            selected_staff = None
+            match_reason = None
+
+            # 1. Prefer active housekeeper already assigned to this room
+            same_room_task_stmt = (
+                select(OperationalTaskEntity)
+                .where(
+                    OperationalTaskEntity.room_id == task_ent.room_id,
+                    OperationalTaskEntity.id != task_ent.id,
+                    OperationalTaskEntity.task_type.in_([
+                        TaskType.GUEST_REQUEST.value,
+                        "GUEST_REQUEST",
+                    ]),
+                    OperationalTaskEntity.status.in_([
+                        TaskStatus.ASSIGNED.value,
+                        TaskStatus.IN_PROGRESS.value,
+                        "ASSIGNED",
+                        "IN_PROGRESS",
+                    ]),
+                    OperationalTaskEntity.assigned_staff_id.isnot(None),
+                )
+                .order_by(
+                    OperationalTaskEntity.created_at.desc(),
+                    OperationalTaskEntity.id.desc(),
+                )
+            )
+            active_room_tasks = list(session.execute(same_room_task_stmt).scalars().all())
+            for art in active_room_tasks:
+                cand_staff = session.get(StaffEntity, art.assigned_staff_id)
+                if not cand_staff:
+                    continue
+                role = str(getattr(cand_staff, "role", "")).upper()
+                if role not in (StaffRole.HOUSEKEEPING.value, "HOUSEKEEPING"):
+                    continue
+                avail_status = str(getattr(cand_staff, "availability_status", "AVAILABLE")).upper()
+                if avail_status in ("ON_LEAVE", "OFFLINE"):
+                    continue
+                active_count = getattr(cand_staff, "active_task_count", 0) or 0
+                if active_count >= max_active_tasks:
+                    continue
+                selected_staff = cand_staff
+                match_reason = f"Same room match (Room {room_num}), already assigned with {active_count} active tasks"
+                break
+
+            # 2. Fall back to existing rule: free cleaner (is_available == True)
+            if not selected_staff:
+                avail_staff_stmt = select(StaffEntity).where(
+                    StaffEntity.role == StaffRole.HOUSEKEEPING.value,
+                    StaffEntity.is_available == True,
+                )
+                staff_list = list(session.execute(avail_staff_stmt).scalars().all())
+                staff_list = [
+                    s for s in staff_list
+                    if str(getattr(s, "availability_status", "AVAILABLE")).upper() not in ("ON_LEAVE", "OFFLINE")
+                    and getattr(s, "active_task_count", 0) < max_active_tasks
+                ]
+
+                if not staff_list:
+                    continue
+
+                staff_list.sort(
+                    key=lambda s: (
+                        0 if s.assigned_floor == room_floor else 1,
+                        s.active_task_count,
+                        s.id,
+                    )
+                )
+                selected_staff = staff_list[0]
+                match_reason = (
+                    f"Floor {selected_staff.assigned_floor} match, lowest workload ({selected_staff.active_task_count} active tasks)"
+                    if selected_staff.assigned_floor == room_floor
+                    else f"Assigned from Floor {selected_staff.assigned_floor} (workload: {selected_staff.active_task_count} active tasks)"
+                )
+
+            task_ent.assigned_staff_id = selected_staff.id
+            task_ent.status = TaskStatus.ASSIGNED.value
+
+            selected_staff.active_task_count += 1
+            selected_staff.is_available = False
+            selected_staff.assigned_room_id = task_ent.room_id
+
+            # Keep room status OCCUPIED as today (do not modify room_ent.status)
+
+            act_assign = TaskActivityEntity(
+                task_id=task_ent.id,
+                room_id=task_ent.room_id,
+                timestamp=now_utc,
+                event_type="STAFF_ASSIGNED",
+                title="Housekeeper assigned",
+                actor_name="Housekeeping Agent",
+                actor_role="AI Agent",
+                action=f"Assigned {selected_staff.name}",
+                outcome=match_reason,
+            )
+            session.add(act_assign)
+            session.flush()
+            assigned_tasks.append(task_ent)
+
+        return assigned_tasks
+
+    def assign_on_hold_guest_requests(self) -> List[OperationalTask]:
+        """Find ON_HOLD GUEST_REQUEST tasks, oldest first, and assign to available cleaners."""
+        with self.session_factory() as session:
+            assigned = self._assign_on_hold_guest_requests_in_session(session)
+            session.commit()
+            return [self._to_pydantic_task(t) for t in assigned]
+
+    def get_operational_task_by_id(self, task_id: UUID) -> Optional[OperationalTask]:
+        """Read operational task from PostgreSQL by UUID and return Pydantic OperationalTask model."""
+        with self.session_factory() as session:
+            entity = session.get(OperationalTaskEntity, task_id)
+            return self._to_pydantic_task(entity) if entity else None
+
+    def get_tasks_detailed(
+        self,
+        task_type: Optional[str] = None,
+        status_group: Optional[str] = "open",
+        status: Optional[str] = None,
+        priority: Optional[str] = None,
+        floor: Optional[int] = None,
+        staff_id: Optional[int] = None,
+        room_id: Optional[int] = None,
+        search: Optional[str] = None,
+    ) -> List[dict]:
+        """Retrieve rich tasks using SQL joins, window function for display_id, and flexible filtering."""
+        with self.session_factory() as session:
+            # Subquery for deterministic display_id based on creation order per task type
+            seq_subq = (
+                select(
+                    OperationalTaskEntity.id.label("task_id"),
+                    func.row_number()
+                    .over(
+                        partition_by=OperationalTaskEntity.task_type,
+                        order_by=[
+                            OperationalTaskEntity.created_at.asc(),
+                            OperationalTaskEntity.id.asc(),
+                        ],
+                    )
+                    .label("seq_num"),
+                )
+            ).subquery()
+
+            stmt = (
+                select(
+                    OperationalTaskEntity,
+                    seq_subq.c.seq_num,
+                    RoomEntity.room_number,
+                    RoomEntity.floor,
+                    StaffEntity.id.label("staff_id"),
+                    StaffEntity.name.label("staff_name"),
+                    MaintenanceIncidentEntity.description.label("incident_description"),
+                    MaintenanceIncidentEntity.category.label("incident_category"),
+                    MaintenanceIncidentEntity.severity.label("incident_severity"),
+                    MaintenanceIncidentEntity.sla_minutes.label("incident_sla_minutes"),
+                    MaintenanceIncidentEntity.created_at.label("incident_created_at"),
+                )
+                .join(seq_subq, OperationalTaskEntity.id == seq_subq.c.task_id)
+                .outerjoin(RoomEntity, OperationalTaskEntity.room_id == RoomEntity.id)
+                .outerjoin(StaffEntity, OperationalTaskEntity.assigned_staff_id == StaffEntity.id)
+                .outerjoin(
+                    MaintenanceIncidentEntity,
+                    OperationalTaskEntity.id == MaintenanceIncidentEntity.operational_task_id,
+                )
+            )
+
+            # 1. Filter by task_type (cleaning / maintenance / inspection)
+            if task_type:
+                t_lower = task_type.lower()
+                if "clean" in t_lower:
+                    stmt = stmt.where(OperationalTaskEntity.task_type == TaskType.ROOM_CLEANING.value)
+                elif "maint" in t_lower:
+                    stmt = stmt.where(OperationalTaskEntity.task_type == TaskType.ROOM_MAINTENANCE.value)
+                elif "insp" in t_lower:
+                    stmt = stmt.where(OperationalTaskEntity.task_type == TaskType.ROOM_INSPECTION.value)
+                else:
+                    stmt = stmt.where(OperationalTaskEntity.task_type == task_type.upper())
+
+            # 2. Filter by status / status_group
+            if status:
+                stmt = stmt.where(OperationalTaskEntity.status == status.upper())
+            elif status_group:
+                sg_lower = status_group.lower()
+                if sg_lower == "open":
+                    stmt = stmt.where(
+                        OperationalTaskEntity.status.in_([
+                            TaskStatus.PENDING.value,
+                            TaskStatus.ASSIGNED.value,
+                            TaskStatus.IN_PROGRESS.value,
+                            TaskStatus.ON_HOLD.value,
+                        ])
+                    )
+                elif sg_lower == "completed":
+                    stmt = stmt.where(
+                        OperationalTaskEntity.status.in_([
+                            TaskStatus.COMPLETED.value,
+                            TaskStatus.FAILED.value,
+                        ])
+                    )
+                # if sg_lower == "all", no status group filter applied
+
+            # 3. Filter by priority
+            if priority:
+                p_upper = priority.upper()
+                p_map = {
+                    "CRITICAL": "URGENT",
+                    "URGENT": "URGENT",
+                    "HIGH": "HIGH",
+                    "MEDIUM": "STANDARD",
+                    "STANDARD": "STANDARD",
+                    "LOW": "NORMAL",
+                    "NORMAL": "NORMAL",
+                }
+                mapped_p = p_map.get(p_upper, p_upper)
+                stmt = stmt.where(
+                    or_(
+                        OperationalTaskEntity.priority_level == p_upper,
+                        OperationalTaskEntity.priority_level == mapped_p,
+                    )
+                )
+
+            # 4. Filter by floor
+            if floor is not None:
+                stmt = stmt.where(RoomEntity.floor == floor)
+
+            # 5. Filter by staff_id
+            if staff_id is not None:
+                stmt = stmt.where(OperationalTaskEntity.assigned_staff_id == staff_id)
+
+            # 6. Filter by room_id
+            if room_id is not None:
+                stmt = stmt.where(OperationalTaskEntity.room_id == room_id)
+
+            # 7. Filter by search query
+            if search:
+                term = f"%{search.strip()}%"
+                stmt = stmt.where(
+                    or_(
+                        RoomEntity.room_number.ilike(term),
+                        OperationalTaskEntity.notes.ilike(term),
+                        MaintenanceIncidentEntity.description.ilike(term),
+                        StaffEntity.name.ilike(term),
+                    )
+                )
+
+            # 8. Sort: priority_score descending, created_at ascending
+            stmt = stmt.order_by(
+                OperationalTaskEntity.priority_score.desc(),
+                OperationalTaskEntity.created_at.asc(),
+            )
+
+            rows = session.execute(stmt).all()
+
+            results = []
+            for row in rows:
+                task = row[0]
+                seq_num = row[1] or 1
+                room_num = row[2]
+                r_floor = row[3]
+                st_id = row[4]
+                st_name = row[5]
+                inc_desc = row[6]
+                inc_cat = row[7]
+                inc_sev = row[8]
+                inc_sla = row[9]
+                inc_created = row[10]
+
+                is_guest_req = (
+                    task.task_type == TaskType.GUEST_REQUEST.value
+                    or "GUEST" in str(task.task_type).upper()
+                )
+                is_cleaning = (
+                    task.task_type == TaskType.ROOM_CLEANING.value
+                    or "CLEAN" in str(task.task_type).upper()
+                )
+                is_inspection = (
+                    task.task_type == TaskType.ROOM_INSPECTION.value
+                    or "INSP" in str(task.task_type).upper()
+                )
+                prefix = "GR" if is_guest_req else ("INSP" if is_inspection else ("HK" if is_cleaning else "MT"))
+                display_id = f"{prefix}-{seq_num:04d}"
+
+                # Priority label
+                p_level = str(task.priority_level).upper()
+                priority_label_map = {
+                    "URGENT": "Critical",
+                    "CRITICAL": "Critical",
+                    "HIGH": "High",
+                    "STANDARD": "Medium",
+                    "MEDIUM": "Medium",
+                    "NORMAL": "Low",
+                    "LOW": "Low",
+                }
+                priority_label = priority_label_map.get(p_level, task.priority_level)
+
+                # Status label
+                st_val = str(task.status).upper()
+                if is_guest_req:
+                    if st_val == "IN_PROGRESS":
+                        status_label = "Delivering"
+                    elif st_val == "COMPLETED":
+                        status_label = "Delivered"
+                    else:
+                        status_label = st_val.capitalize()
+                elif st_val == "IN_PROGRESS":
+                    status_label = "Cleaning" if is_cleaning else "In repair"
+                elif st_val == "PENDING":
+                    status_label = "Pending"
+                elif st_val == "ASSIGNED":
+                    status_label = "Assigned"
+                elif st_val == "ON_HOLD":
+                    status_label = "On hold"
+                elif st_val == "COMPLETED":
+                    status_label = "Completed"
+                elif st_val == "FAILED":
+                    status_label = "Failed"
+                else:
+                    status_label = st_val.capitalize()
+
+                # Description
+                if is_guest_req:
+                    description = task.notes or "Guest request"
+                elif is_inspection:
+                    description = task.notes or "Supervisor inspection"
+                elif is_cleaning:
+                    description = task.notes or "Room cleaning"
+                else:
+                    description = inc_desc or task.notes or "Maintenance repair"
+
+                # Created at with timezone
+                created_dt = task.created_at
+                if created_dt and created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+                created_at_iso = created_dt.isoformat() if created_dt else None
+
+                # SLA minutes & deadline for maintenance
+                sla_minutes = None
+                sla_deadline_iso = None
+                if not is_cleaning and not is_guest_req and inc_sla:
+                    sla_minutes = inc_sla
+                    base_time = inc_created or task.created_at
+                    if base_time:
+                        if base_time.tzinfo is None:
+                            base_time = base_time.replace(tzinfo=timezone.utc)
+                        deadline_dt = base_time + timedelta(minutes=inc_sla)
+                        sla_deadline_iso = deadline_dt.isoformat()
+
+                task_dict = {
+                    "id": task.id,
+                    "display_id": display_id,
+                    "task_type": task.task_type,
+                    "type_label": "Guest request" if is_guest_req else ("Inspection" if is_inspection else ("Cleaning" if is_cleaning else "Maintenance")),
+                    "description": description,
+                    "room_id": task.room_id,
+                    "room_number": room_num or str(task.room_id),
+                    "floor": r_floor if r_floor is not None else 1,
+                    "assigned_staff": {"id": st_id, "name": st_name} if st_id else None,
+                    "assigned_staff_id": st_id,
+                    "priority_score": task.priority_score,
+                    "priority_level": task.priority_level,
+                    "priority_label": priority_label,
+                    "status": task.status,
+                    "status_label": status_label,
+                    "created_at": created_at_iso,
+                    "sla_minutes": sla_minutes,
+                    "sla_deadline": sla_deadline_iso,
+                    "incident_category": inc_cat if not is_cleaning else None,
+                    "incident_severity": inc_sev if not is_cleaning else None,
+                    "notes": task.notes,
+                }
+                results.append(task_dict)
+
+            # If search string matches display_id or other fields, refine search
+            if search:
+                s_upper = search.strip().upper()
+                results = [
+                    r
+                    for r in results
+                    if s_upper in r["display_id"].upper()
+                    or s_upper in str(r["room_number"]).upper()
+                    or s_upper in str(r["description"]).upper()
+                    or (r["assigned_staff"] and s_upper in r["assigned_staff"]["name"].upper())
+                ]
+
+            return results
+
+    def get_tasks_summary(self) -> dict:
+        """Calculate open count, assigned count, counts by type and by priority using real SQL queries."""
+        with self.session_factory() as session:
+            total = session.scalar(select(func.count(OperationalTaskEntity.id))) or 0
+
+            # Open count: PENDING, ASSIGNED, IN_PROGRESS, ON_HOLD
+            open_count = session.scalar(
+                select(func.count(OperationalTaskEntity.id)).where(
+                    OperationalTaskEntity.status.in_([
+                        TaskStatus.PENDING.value,
+                        TaskStatus.ASSIGNED.value,
+                        TaskStatus.IN_PROGRESS.value,
+                        TaskStatus.ON_HOLD.value,
+                    ])
+                )
+            ) or 0
+
+            # Assigned count: ASSIGNED tasks or open tasks with assigned staff
+            assigned_count = session.scalar(
+                select(func.count(OperationalTaskEntity.id)).where(
+                    OperationalTaskEntity.assigned_staff_id.isnot(None),
+                    OperationalTaskEntity.status.in_([
+                        TaskStatus.ASSIGNED.value,
+                        TaskStatus.IN_PROGRESS.value,
+                        TaskStatus.ON_HOLD.value,
+                        TaskStatus.PENDING.value,
+                    ]),
+                )
+            ) or 0
+
+            # By type
+            type_rows = session.execute(
+                select(OperationalTaskEntity.task_type, func.count(OperationalTaskEntity.id))
+                .group_by(OperationalTaskEntity.task_type)
+            ).all()
+            by_type = {"cleaning": 0, "maintenance": 0, "inspection": 0}
+            for t_val, cnt in type_rows:
+                if t_val:
+                    if "CLEAN" in str(t_val).upper():
+                        by_type["cleaning"] += cnt
+                    elif "MAINT" in str(t_val).upper():
+                        by_type["maintenance"] += cnt
+                    elif "INSP" in str(t_val).upper():
+                        by_type["inspection"] += cnt
+
+            # By priority
+            priority_rows = session.execute(
+                select(OperationalTaskEntity.priority_level, func.count(OperationalTaskEntity.id))
+                .group_by(OperationalTaskEntity.priority_level)
+            ).all()
+            by_priority = {
+                "urgent": 0,
+                "high": 0,
+                "standard": 0,
+                "normal": 0,
+            }
+            for p_val, cnt in priority_rows:
+                if p_val:
+                    p_up = str(p_val).upper()
+                    if p_up in ("URGENT", "CRITICAL"):
+                        by_priority["urgent"] += cnt
+                    elif p_up == "HIGH":
+                        by_priority["high"] += cnt
+                    elif p_up in ("STANDARD", "MEDIUM"):
+                        by_priority["standard"] += cnt
+                    elif p_up in ("NORMAL", "LOW"):
+                        by_priority["normal"] += cnt
+
+            # By status
+            status_rows = session.execute(
+                select(OperationalTaskEntity.status, func.count(OperationalTaskEntity.id))
+                .group_by(OperationalTaskEntity.status)
+            ).all()
+            by_status = {s.value: 0 for s in TaskStatus}
+            for st_val, cnt in status_rows:
+                if st_val and st_val in by_status:
+                    by_status[st_val] = cnt
+
+            return {
+                "total": total,
+                "open_count": open_count,
+                "assigned_count": assigned_count,
+                "by_type": by_type,
+                "by_priority": by_priority,
+                "by_status": by_status,
+            }
+
+    def update_room_status(self, room_id: int, new_status: Union[str, RoomStatus]) -> None:
+        """Update room status in PostgreSQL database."""
+        status_val = new_status.value if hasattr(new_status, "value") else str(new_status)
+        with self.session_factory() as session:
+            room_entity = session.get(RoomEntity, room_id)
+            if not room_entity:
+                raise ValueError(f"Room with ID {room_id} not found.")
+            room_entity.status = status_val
+            session.commit()
+
+    def save_operational_task(self, task: OperationalTask) -> OperationalTask:
+        """Save or update an operational task in PostgreSQL database."""
+        status_val = task.status.value if hasattr(task.status, "value") else str(task.status)
+        type_val = task.task_type.value if hasattr(task.task_type, "value") else str(task.task_type)
+        with self.session_factory() as session:
+            existing = session.get(OperationalTaskEntity, task.id)
+            if existing:
+                existing.room_id = task.room_id
+                existing.task_type = type_val
+                existing.priority_score = task.priority_score
+                existing.priority_level = task.priority_level
+                existing.status = status_val
+                existing.assigned_staff_id = task.assigned_staff_id
+                if task.started_at is not None:
+                    s_at = task.started_at
+                    if s_at.tzinfo is None:
+                        s_at = s_at.replace(tzinfo=timezone.utc)
+                    existing.started_at = s_at
+                existing.notes = task.notes
+            else:
+                c_at = task.created_at or datetime.now(timezone.utc)
+                if c_at.tzinfo is None:
+                    c_at = c_at.replace(tzinfo=timezone.utc)
+                s_at = task.started_at
+                if s_at and s_at.tzinfo is None:
+                    s_at = s_at.replace(tzinfo=timezone.utc)
+                task_entity = OperationalTaskEntity(
+                    id=task.id,
+                    room_id=task.room_id,
+                    task_type=type_val,
+                    priority_score=task.priority_score,
+                    priority_level=task.priority_level,
+                    status=status_val,
+                    assigned_staff_id=task.assigned_staff_id,
+                    created_at=c_at,
+                    started_at=s_at,
+                    notes=task.notes,
+                )
+                session.add(task_entity)
+            session.commit()
+        return task
+
+    def assign_task_to_staff(self, task_id: UUID, staff_id: int) -> OperationalTask:
+        """Assign an operational task to a staff member in PostgreSQL database."""
+        with self.session_factory() as session:
+            task_entity = session.get(OperationalTaskEntity, task_id)
+            if not task_entity:
+                raise ValueError(f"Task with ID {task_id} not found.")
+            staff_entity = session.get(StaffEntity, staff_id)
+            if not staff_entity:
+                raise ValueError(f"Staff with ID {staff_id} not found.")
+
+            task_entity.assigned_staff_id = staff_id
+            task_entity.status = TaskStatus.ASSIGNED.value
+            staff_entity.active_task_count += 1
+            staff_entity.is_available = False
+            staff_entity.assigned_room_id = task_entity.room_id
+            session.commit()
+            return self._to_pydantic_task(task_entity)
+
+    @property
+    def rooms(self) -> Dict[int, Room]:
+        """Return dictionary of all rooms keyed by room ID from PostgreSQL."""
+        with self.session_factory() as session:
+            entities = session.execute(select(RoomEntity)).scalars().all()
+            return {e.id: self._to_pydantic_room(e) for e in entities}
+
+    @property
+    def staff(self) -> Dict[int, Staff]:
+        """Return dictionary of all staff keyed by staff ID from PostgreSQL."""
+        with self.session_factory() as session:
+            entities = session.execute(select(StaffEntity)).scalars().all()
+            return {e.id: self._to_pydantic_staff(e) for e in entities}
+
+    @property
+    def operational_tasks(self) -> Dict[UUID, OperationalTask]:
+        """Return dictionary of all operational tasks keyed by task UUID from PostgreSQL."""
+        with self.session_factory() as session:
+            entities = session.execute(select(OperationalTaskEntity)).scalars().all()
+            return {e.id: self._to_pydantic_task(e) for e in entities}
+
+    def get_available_maintenance_staff(
+        self, required_skills: Union[MaintenanceSkill, str, List[Union[MaintenanceSkill, str]]], room_floor: Optional[int] = None
+    ) -> list[Staff]:
+        """Return available maintenance staff having at least one of the required skills sorted by primary skill match, floor proximity, active task count, and ID."""
+        if not isinstance(required_skills, list):
+            skills_list = [required_skills]
+        else:
+            skills_list = required_skills
+
+        skill_enums = [
+            s if isinstance(s, MaintenanceSkill) else MaintenanceSkill(str(s))
+            for s in skills_list
+        ]
+        specialist_skills = [s for s in skill_enums if s != MaintenanceSkill.GENERAL]
+
+        with self.session_factory() as session:
+            stmt = select(StaffEntity).where(
+                StaffEntity.role == StaffRole.MAINTENANCE.value,
+            )
+            staff_entities = list(session.execute(stmt).scalars().all())
+            staff_models = [self._to_pydantic_staff(s) for s in staff_entities]
+
+            # Exclude staff who are on leave or offline, but include staff with queued tasks
+            filtered = [
+                s for s in staff_models
+                if s.role == StaffRole.MAINTENANCE
+                and str(getattr(s, "availability_status", "AVAILABLE")).upper() not in ("ON_LEAVE", "OFFLINE")
+                and any(sk in s.skills for sk in skill_enums)
+            ]
+
+            def staff_sort_key(s: Staff):
+                has_specialist = any(sk in s.skills for sk in specialist_skills) if specialist_skills else (MaintenanceSkill.GENERAL in s.skills)
+                skill_rank = 0 if has_specialist else 1
+                floor_dist = abs(s.assigned_floor - room_floor) if (room_floor is not None and s.assigned_floor is not None) else 0
+                return (skill_rank, floor_dist, s.active_task_count or 0, s.id)
+
+            filtered.sort(key=staff_sort_key)
+            return filtered
+
+    @property
+    def maintenance_incidents(self) -> Dict[UUID, MaintenanceIncident]:
+        """Return dictionary of all maintenance incidents keyed by incident UUID from PostgreSQL."""
+        with self.session_factory() as session:
+            entities = session.execute(select(MaintenanceIncidentEntity)).scalars().all()
+            return {e.id: self._to_pydantic_incident(e) for e in entities}
+
+    def save_maintenance_incident(
+        self, incident: MaintenanceIncident
+    ) -> MaintenanceIncident:
+        """Save or update a maintenance incident in PostgreSQL database."""
+        cat_val = incident.category.value if hasattr(incident.category, "value") else str(incident.category)
+        sev_val = incident.severity.value if hasattr(incident.severity, "value") else str(incident.severity)
+        status_val = incident.status.value if hasattr(incident.status, "value") else str(incident.status)
+
+        with self.session_factory() as session:
+            existing = session.get(MaintenanceIncidentEntity, incident.id)
+            if existing:
+                existing.room_id = incident.room_id
+                existing.reported_by_staff_id = incident.reported_by_staff_id
+                existing.description = incident.description
+                existing.category = cat_val
+                existing.severity = sev_val
+                existing.affects_room_readiness = incident.affects_room_readiness
+                existing.status = status_val
+                existing.assigned_technician_id = incident.assigned_technician_id
+                existing.sla_minutes = incident.sla_minutes
+                existing.operational_task_id = incident.operational_task_id
+                existing.category_reason = incident.category_reason
+                existing.severity_reason = incident.severity_reason
+                existing.confidence_score = incident.confidence_score
+                existing.decision_source = incident.decision_source or "RULE_TABLE"
+                existing.safety_rule_applied = incident.safety_rule_applied or False
+                existing.safety_rule_text = incident.safety_rule_text
+                existing.technician_match_reason = incident.technician_match_reason
+                existing.is_fallback = incident.is_fallback or False
+                existing.needs_human_review = incident.needs_human_review or False
+                existing.resolved_at = incident.resolved_at
+                existing.original_ai_decision = incident.original_ai_decision
+                existing.blocks_housekeeping = incident.blocks_housekeeping
+                existing.housekeeping_hold_reason = incident.housekeeping_hold_reason
+            else:
+                inc_c_at = incident.created_at or datetime.now(timezone.utc)
+                if inc_c_at.tzinfo is None:
+                    inc_c_at = inc_c_at.replace(tzinfo=timezone.utc)
+                incident_entity = MaintenanceIncidentEntity(
+                    id=incident.id,
+                    room_id=incident.room_id,
+                    reported_by_staff_id=incident.reported_by_staff_id,
+                    description=incident.description,
+                    category=cat_val,
+                    severity=sev_val,
+                    affects_room_readiness=incident.affects_room_readiness,
+                    status=status_val,
+                    assigned_technician_id=incident.assigned_technician_id,
+                    sla_minutes=incident.sla_minutes,
+                    created_at=inc_c_at,
+                    operational_task_id=incident.operational_task_id,
+                    category_reason=incident.category_reason,
+                    severity_reason=incident.severity_reason,
+                    confidence_score=incident.confidence_score,
+                    decision_source=incident.decision_source or "RULE_TABLE",
+                    safety_rule_applied=incident.safety_rule_applied or False,
+                    safety_rule_text=incident.safety_rule_text,
+                    technician_match_reason=incident.technician_match_reason,
+                    is_fallback=incident.is_fallback or False,
+                    needs_human_review=incident.needs_human_review or False,
+                    resolved_at=incident.resolved_at,
+                    original_ai_decision=incident.original_ai_decision,
+                    blocks_housekeeping=incident.blocks_housekeeping,
+                    housekeeping_hold_reason=incident.housekeeping_hold_reason,
+                )
+                session.add(incident_entity)
+            session.commit()
+
+        return incident
+
+    def get_maintenance_incident_by_id(
+        self, incident_id: Union[UUID, str]
+    ) -> Optional[MaintenanceIncident]:
+        """Return matching MaintenanceIncident from PostgreSQL or None if not found."""
+        uid = UUID(str(incident_id)) if isinstance(incident_id, str) else incident_id
+        with self.session_factory() as session:
+            entity = session.get(MaintenanceIncidentEntity, uid)
+            return self._to_pydantic_incident(entity) if entity else None
+
+    def assign_incident_to_technician(
+        self, incident_id: Union[UUID, str], technician_id: int
+    ) -> MaintenanceIncident:
+        """Assign an incident to a technician and update statuses in PostgreSQL."""
+        uid = UUID(str(incident_id)) if isinstance(incident_id, str) else incident_id
+        with self.session_factory() as session:
+            incident_entity = session.get(MaintenanceIncidentEntity, uid)
+            if not incident_entity:
+                raise ValueError(f"Maintenance incident with ID {incident_id} not found.")
+
+            staff_entity = session.get(StaffEntity, technician_id)
+            if not staff_entity:
+                raise ValueError(f"Staff with ID {technician_id} not found.")
+
+            incident_entity.assigned_technician_id = technician_id
+            incident_entity.status = IncidentStatus.ASSIGNED.value
+
+            staff_entity.assigned_room_id = incident_entity.room_id
+            session.commit()
+            return self._to_pydantic_incident(incident_entity)
+
+    def complete_task(
+        self,
+        task_id: UUID,
+        actor_name: str = settings.CURRENT_USER_NAME,
+        actor_role: str = settings.CURRENT_USER_ROLE,
+    ) -> OperationalTask:
+        """Mark an operational task as completed, release assigned staff, and update room status."""
+        with self.session_factory() as session:
+            task_entity = session.get(OperationalTaskEntity, task_id)
+            if not task_entity:
+                raise ValueError(f"Task with ID {task_id} not found.")
+
+            if task_entity.status == TaskStatus.COMPLETED.value:
+                raise ValueError(f"Task {task_id} is already completed.")
+            if task_entity.status == TaskStatus.CANCELLED.value:
+                raise ValueError(f"Cannot complete cancelled task {task_id}.")
+
+            task_entity.status = TaskStatus.COMPLETED.value
+
+            # Guarded early branch for GUEST_REQUEST
+            if (
+                task_entity.task_type == TaskType.GUEST_REQUEST.value
+                or task_entity.task_type == "GUEST_REQUEST"
+            ):
+                if task_entity.assigned_staff_id:
+                    staff_entity = session.get(StaffEntity, task_entity.assigned_staff_id)
+                    if staff_entity:
+                        remaining_staff_tasks_stmt = select(OperationalTaskEntity).where(
+                            OperationalTaskEntity.assigned_staff_id == staff_entity.id,
+                            OperationalTaskEntity.id != task_id,
+                            OperationalTaskEntity.status.in_([
+                                TaskStatus.PENDING.value,
+                                TaskStatus.ASSIGNED.value,
+                                TaskStatus.IN_PROGRESS.value,
+                            ]),
+                        )
+                        remaining_staff_tasks = list(session.execute(remaining_staff_tasks_stmt).scalars().all())
+                        staff_entity.active_task_count = len(remaining_staff_tasks)
+                        if not remaining_staff_tasks:
+                            staff_entity.is_available = True
+                            staff_entity.assigned_room_id = None
+                        else:
+                            staff_entity.assigned_room_id = remaining_staff_tasks[0].room_id
+
+                act_event = TaskActivityEntity(
+                    task_id=task_id,
+                    room_id=task_entity.room_id,
+                    timestamp=datetime.now(timezone.utc),
+                    event_type="TASK_COMPLETED",
+                    title="Delivered",
+                    actor_name=actor_name,
+                    actor_role=actor_role,
+                    action=f"Delivered by {actor_name}",
+                    outcome="Delivered",
+                )
+                session.add(act_event)
+                self._assign_on_hold_guest_requests_in_session(session)
+                session.commit()
+                return self._to_pydantic_task(task_entity)
+
+            # Update associated maintenance incident if one exists
+            inc_stmt = select(MaintenanceIncidentEntity).where(
+                or_(
+                    MaintenanceIncidentEntity.operational_task_id == task_id,
+                    (
+                        MaintenanceIncidentEntity.room_id == task_entity.room_id
+                        and MaintenanceIncidentEntity.assigned_technician_id == task_entity.assigned_staff_id
+                        and MaintenanceIncidentEntity.status == IncidentStatus.ASSIGNED.value
+                    ),
+                )
+            )
+            incidents = session.execute(inc_stmt).scalars().all()
+            for inc in incidents:
+                inc.status = IncidentStatus.RESOLVED.value
+
+            # Release assigned staff
+            if task_entity.assigned_staff_id:
+                staff_entity = session.get(StaffEntity, task_entity.assigned_staff_id)
+                if staff_entity:
+                    # Check if this staff member has any other active tasks
+                    remaining_staff_tasks_stmt = select(OperationalTaskEntity).where(
+                        OperationalTaskEntity.assigned_staff_id == staff_entity.id,
+                        OperationalTaskEntity.id != task_id,
+                        OperationalTaskEntity.status.in_([
+                            TaskStatus.PENDING.value,
+                            TaskStatus.ASSIGNED.value,
+                            TaskStatus.IN_PROGRESS.value,
+                        ]),
+                    )
+                    remaining_staff_tasks = list(session.execute(remaining_staff_tasks_stmt).scalars().all())
+                    staff_entity.active_task_count = len(remaining_staff_tasks)
+
+                    if not remaining_staff_tasks:
+                        staff_entity.is_available = True
+                        staff_entity.assigned_room_id = None
+                    else:
+                        staff_entity.assigned_room_id = remaining_staff_tasks[0].room_id
+
+            # Update room status and orchestrate next steps based on task type
+            is_cleaning = (
+                task_entity.task_type == TaskType.ROOM_CLEANING.value
+                or "CLEAN" in str(task_entity.task_type).upper()
+            )
+            is_inspection = (
+                task_entity.task_type == TaskType.ROOM_INSPECTION.value
+                or "INSP" in str(task_entity.task_type).upper()
+            )
+            room_entity = session.get(RoomEntity, task_entity.room_id)
+            if room_entity:
+                task_type_val = task_entity.task_type
+
+                if task_type_val == TaskType.ROOM_MAINTENANCE.value:
+                    if room_entity.status != RoomStatus.OCCUPIED.value:
+                        remaining_maint_stmt = select(OperationalTaskEntity).where(
+                            OperationalTaskEntity.room_id == task_entity.room_id,
+                            OperationalTaskEntity.id != task_id,
+                            OperationalTaskEntity.task_type == TaskType.ROOM_MAINTENANCE.value,
+                            OperationalTaskEntity.status.in_([
+                                TaskStatus.PENDING.value,
+                                TaskStatus.ASSIGNED.value,
+                                TaskStatus.IN_PROGRESS.value,
+                                TaskStatus.ON_HOLD.value,
+                            ]),
+                        )
+                        remaining_maint = list(session.execute(remaining_maint_stmt).scalars().all())
+                        if remaining_maint:
+                            room_entity.status = RoomStatus.MAINTENANCE.value
+                        else:
+                            # Check on-hold housekeeping tasks
+                            on_hold_tasks_stmt = select(OperationalTaskEntity).where(
+                                OperationalTaskEntity.room_id == task_entity.room_id,
+                                OperationalTaskEntity.task_type == TaskType.ROOM_CLEANING.value,
+                                OperationalTaskEntity.status == TaskStatus.ON_HOLD.value,
+                            )
+                            on_hold_tasks = list(session.execute(on_hold_tasks_stmt).scalars().all())
+                            for oh_t in on_hold_tasks:
+                                oh_t.status = TaskStatus.ASSIGNED.value
+                            if on_hold_tasks:
+                                room_entity.status = RoomStatus.CLEANING.value
+                            else:
+                                room_entity.status = RoomStatus.READY.value
+                elif task_type_val == TaskType.ROOM_CLEANING.value:
+                    remaining_room_tasks_stmt = select(OperationalTaskEntity).where(
+                        OperationalTaskEntity.room_id == task_entity.room_id,
+                        OperationalTaskEntity.id != task_id,
+                        OperationalTaskEntity.status.in_([
+                            TaskStatus.PENDING.value,
+                            TaskStatus.ASSIGNED.value,
+                            TaskStatus.IN_PROGRESS.value,
+                            TaskStatus.ON_HOLD.value,
+                        ]),
+                    )
+                    remaining_room_tasks = list(session.execute(remaining_room_tasks_stmt).scalars().all())
+
+                    if not remaining_room_tasks:
+                        # Cleaning complete: Transition to INSPECTION and trigger supervisor inspection
+                        if room_entity.status != RoomStatus.OCCUPIED.value:
+                            room_entity.status = RoomStatus.INSPECTION.value
+
+                            # Check if an inspection task already exists
+                            existing_insp_stmt = select(OperationalTaskEntity).where(
+                                OperationalTaskEntity.room_id == task_entity.room_id,
+                                OperationalTaskEntity.task_type == TaskType.ROOM_INSPECTION.value,
+                                OperationalTaskEntity.status.in_([
+                                    TaskStatus.PENDING.value,
+                                    TaskStatus.ASSIGNED.value,
+                                    TaskStatus.IN_PROGRESS.value,
+                                ]),
+                            )
+                            existing_insp = session.execute(existing_insp_stmt).scalar_one_or_none()
+                            if not existing_insp:
+                                # Lookup floor supervisor (Rahul Deshpande / ID 401)
+                                sup_stmt = select(StaffEntity).where(
+                                    or_(
+                                        StaffEntity.role == StaffRole.SUPERVISOR.value,
+                                        StaffEntity.id == 401,
+                                        StaffEntity.name.ilike(f"%{settings.DEFAULT_SUPERVISOR_NAME}%"),
+                                    )
+                                ).limit(1)
+                                sup_staff = session.execute(sup_stmt).scalar_one_or_none()
+                                sup_id = sup_staff.id if sup_staff else None
+                                sup_name = sup_staff.name if sup_staff else settings.DEFAULT_SUPERVISOR_NAME
+
+                                insp_task = OperationalTaskEntity(
+                                    id=uuid4(),
+                                    room_id=task_entity.room_id,
+                                    task_type=TaskType.ROOM_INSPECTION.value,
+                                    priority_score=task_entity.priority_score,
+                                    priority_level=task_entity.priority_level,
+                                    status=TaskStatus.ASSIGNED.value if sup_id else TaskStatus.PENDING.value,
+                                    assigned_staff_id=sup_id,
+                                    notes="Room turnover cleaning finished. Supervisor inspection required before room can be sold.",
+                                )
+                                session.add(insp_task)
+                                session.flush()
+
+                                # Log activity event for inspection requested
+                                insp_act = TaskActivityEntity(
+                                    task_id=insp_task.id,
+                                    room_id=task_entity.room_id,
+                                    timestamp=datetime.now(timezone.utc),
+                                    event_type="INSPECTION_REQUESTED",
+                                    title="Inspection requested",
+                                    actor_name="Room Readiness Agent",
+                                    actor_role="AI Agent",
+                                    action="Turnover cleaning completed; supervisor inspection requested",
+                                    outcome=f"Assigned to {sup_name}",
+                                )
+                                session.add(insp_act)
+                        else:
+                            room_entity.status = RoomStatus.OCCUPIED.value
+                    else:
+                        has_maintenance = any(t.task_type == TaskType.ROOM_MAINTENANCE.value for t in remaining_room_tasks)
+                        if has_maintenance:
+                            room_entity.status = RoomStatus.MAINTENANCE.value
+                        elif room_entity.status != RoomStatus.OCCUPIED.value:
+                            room_entity.status = RoomStatus.CLEANING.value
+                elif is_inspection:
+                    remaining_room_tasks_stmt = select(OperationalTaskEntity).where(
+                        OperationalTaskEntity.room_id == task_entity.room_id,
+                        OperationalTaskEntity.id != task_id,
+                        OperationalTaskEntity.status.in_([
+                            TaskStatus.PENDING.value,
+                            TaskStatus.ASSIGNED.value,
+                            TaskStatus.IN_PROGRESS.value,
+                            TaskStatus.ON_HOLD.value,
+                        ]),
+                    )
+                    remaining_room_tasks = list(session.execute(remaining_room_tasks_stmt).scalars().all())
+                    if not remaining_room_tasks:
+                        room_entity.status = RoomStatus.READY.value
+                    else:
+                        has_maint = any(
+                            t.task_type == TaskType.ROOM_MAINTENANCE.value
+                            or "MAINT" in str(t.task_type).upper()
+                            for t in remaining_room_tasks
+                        )
+                        if has_maint:
+                            room_entity.status = RoomStatus.MAINTENANCE.value
+                        else:
+                            room_entity.status = RoomStatus.READY.value
+                else:
+                    remaining_room_tasks_stmt = select(OperationalTaskEntity).where(
+                        OperationalTaskEntity.room_id == task_entity.room_id,
+                        OperationalTaskEntity.id != task_id,
+                        OperationalTaskEntity.status.in_([
+                            TaskStatus.PENDING.value,
+                            TaskStatus.ASSIGNED.value,
+                            TaskStatus.IN_PROGRESS.value,
+                            TaskStatus.ON_HOLD.value,
+                        ]),
+                    )
+                    remaining_room_tasks = list(session.execute(remaining_room_tasks_stmt).scalars().all())
+                    if not remaining_room_tasks:
+                        room_entity.status = RoomStatus.READY.value
+
+            # Log activity event
+            if is_inspection:
+                event_type = "INSPECTION_PASSED"
+                title = "Inspection passed"
+                if actor_role and actor_role.upper() == "MANAGER":
+                    act_name = f"Manager {actor_name}" if "Manager" not in (actor_name or "") else actor_name
+                    act_role = "MANAGER"
+                    action_text = "Manager inspected and approved room"
+                else:
+                    act_name = (
+                        "Supervisor Rahul Deshpande"
+                        if (not actor_name or actor_name in (settings.CURRENT_USER_NAME, "Rahul Deshpande", settings.DEFAULT_SUPERVISOR_NAME))
+                        else (f"Supervisor {actor_name}" if "Supervisor" not in actor_name else actor_name)
+                    )
+                    act_role = "SUPERVISOR"
+                    action_text = "Supervisor inspected and approved room"
+                outcome_text = "Room marked READY (Sellable)"
+            elif is_cleaning:
+                event_type = "TASK_COMPLETED"
+                title = "Task completed"
+                act_name = actor_name
+                act_role = actor_role
+                action_text = f"Completed by {actor_name}"
+                outcome_text = "Cleaning completed · Room awaiting supervisor inspection"
+            else:
+                event_type = "TASK_COMPLETED"
+                title = "Task completed"
+                act_name = actor_name
+                act_role = actor_role
+                action_text = f"Completed by {actor_name}"
+                outcome_text = "Repair completed"
+
+            act_event = TaskActivityEntity(
+                task_id=task_id,
+                room_id=task_entity.room_id,
+                timestamp=datetime.now(timezone.utc),
+                event_type=event_type,
+                title=title,
+                actor_name=act_name,
+                actor_role=act_role,
+                action=action_text,
+                outcome=outcome_text,
+            )
+            session.add(act_event)
+            self._assign_on_hold_guest_requests_in_session(session)
+
+            session.commit()
+            return self._to_pydantic_task(task_entity)
+
+    def get_housekeeping_board(self, floor: Optional[int] = None) -> Dict[str, Any]:
+        """Generate housekeeping board data matching the Operations prototype."""
+        now_utc = datetime.now(timezone.utc)
+        tz_hotel = ZoneInfo("Asia/Kolkata")
+        now_local = datetime.now(tz_hotel)
+        start_of_today_local = datetime.combine(now_local.date(), time.min, tzinfo=tz_hotel)
+        start_of_today_utc = start_of_today_local.astimezone(timezone.utc)
+
+        with self.session_factory() as session:
+            # 1. Fetch all rooms
+            all_rooms = session.execute(select(RoomEntity)).scalars().all()
+            all_rooms_by_id = {r.id: r for r in all_rooms}
+
+            # Filter rooms by floor if specified
+            if floor is not None:
+                filtered_rooms = [r for r in all_rooms if r.floor == floor]
+            else:
+                filtered_rooms = all_rooms
+            filtered_room_ids = {r.id for r in filtered_rooms}
+
+            # 2. Fetch all staff to map staff IDs to names/details
+            all_staff_entities = session.execute(select(StaffEntity)).scalars().all()
+            staff_by_id = {s.id: s for s in all_staff_entities}
+
+            # Housekeeping staff
+            hk_staff_list = [
+                s for s in all_staff_entities
+                if s.role and ("HOUSEKEEP" in s.role.upper() or "CLEAN" in s.role.upper())
+            ]
+            hk_staff_list.sort(key=lambda s: (s.assigned_floor or 0, s.name))
+
+            # 3. Create deterministic display IDs for all cleaning tasks
+            all_cleaning_tasks_stmt = (
+                select(OperationalTaskEntity)
+                .where(OperationalTaskEntity.task_type == TaskType.ROOM_CLEANING.value)
+                .order_by(OperationalTaskEntity.created_at.asc(), OperationalTaskEntity.id.asc())
+            )
+            all_cleaning_tasks = list(session.execute(all_cleaning_tasks_stmt).scalars().all())
+            display_id_map = {
+                t.id: f"HK-{idx + 1:04d}" for idx, t in enumerate(all_cleaning_tasks)
+            }
+
+            # 4. Fetch upcoming reservations with guests
+            reservations_stmt = (
+                select(ReservationEntity, GuestEntity)
+                .join(GuestEntity, ReservationEntity.guest_id == GuestEntity.id)
+                .where(ReservationEntity.check_out_time >= now_utc - timedelta(days=1))
+                .order_by(ReservationEntity.check_in_time.asc())
+            )
+            res_rows = session.execute(reservations_stmt).all()
+
+            # Map room_id -> next reservation / guest info
+            room_next_guest_map: Dict[int, Dict[str, Any]] = {}
+            for res_ent, guest_ent in res_rows:
+                r_id = res_ent.room_id
+                if r_id in room_next_guest_map:
+                    continue  # already stored the earliest upcoming reservation
+
+                check_in_dt = res_ent.check_in_time
+                if check_in_dt and check_in_dt.tzinfo is None:
+                    check_in_dt = check_in_dt.replace(tzinfo=timezone.utc)
+
+                is_vip = bool(guest_ent.guest_type and "VIP" in guest_ent.guest_type.upper())
+                diff_sec = (check_in_dt - now_utc).total_seconds() if check_in_dt else 0
+                diff_min = int(diff_sec / 60)
+
+                if diff_min > 0:
+                    if diff_min < 60:
+                        arrival_label = f"arriving in {diff_min}m"
+                    else:
+                        hours = diff_min // 60
+                        mins = diff_min % 60
+                        arrival_label = f"arriving in {hours}h {mins}m" if mins > 0 else f"arriving in {hours}h"
+                else:
+                    arrival_label = "arrived / in-house"
+
+                # Priority reason label (for VIP or arriving within 2h = 7200s)
+                arriving_soon = (0 <= diff_sec <= 7200)
+                if is_vip and arriving_soon:
+                    priority_reason = f"VIP · {arrival_label}"
+                elif is_vip:
+                    priority_reason = "VIP"
+                elif arriving_soon:
+                    priority_reason = arrival_label
+                else:
+                    priority_reason = None
+
+                room_next_guest_map[r_id] = {
+                    "guest_name": f"{guest_ent.first_name} {guest_ent.last_name}".strip(),
+                    "is_vip": is_vip,
+                    "check_in_time": check_in_dt.isoformat() if check_in_dt else None,
+                    "arrival_label": arrival_label,
+                    "arriving_soon": arriving_soon,
+                    "priority_reason": priority_reason,
+                }
+
+            # 5. Fetch maintenance incidents for blocked reasons
+            maint_incidents = session.execute(
+                select(MaintenanceIncidentEntity).where(
+                    MaintenanceIncidentEntity.status.in_([
+                        IncidentStatus.OPEN.value,
+                        IncidentStatus.ASSIGNED.value,
+                    ])
+                )
+            ).scalars().all()
+            maint_by_room: Dict[int, MaintenanceIncidentEntity] = {
+                inc.room_id: inc for inc in maint_incidents
+            }
+
+            # 6. Attendants list calculation
+            # Calculate open tasks and availability for each housekeeping staff member
+            open_cleaning_tasks = [
+                t for t in all_cleaning_tasks
+                if t.status in (
+                    TaskStatus.PENDING.value,
+                    TaskStatus.ASSIGNED.value,
+                    TaskStatus.IN_PROGRESS.value,
+                    TaskStatus.ON_HOLD.value,
+                )
+            ]
+
+            attendants_data = []
+            available_cleaners_count = 0
+            busy_cleaners_count = 0
+            off_cleaners_count = 0
+
+            for st in hk_staff_list:
+                st_assigned_tasks = [t for t in open_cleaning_tasks if t.assigned_staff_id == st.id]
+                open_cnt = len(st_assigned_tasks)
+                in_prog_task = next((t for t in st_assigned_tasks if t.status == TaskStatus.IN_PROGRESS.value), None)
+
+                if in_prog_task:
+                    avail_status = "busy"
+                    busy_cleaners_count += 1
+                    in_prog_room = all_rooms_by_id.get(in_prog_task.room_id)
+                    room_str = in_prog_room.room_number if in_prog_room else str(in_prog_task.room_id)
+                    current_task_str = f"Cleaning {room_str}"
+                elif not st.is_available and open_cnt == 0:
+                    avail_status = "off"
+                    off_cleaners_count += 1
+                    current_task_str = f"Floor {st.assigned_floor}" if st.assigned_floor else "Offline"
+                else:
+                    avail_status = "available"
+                    available_cleaners_count += 1
+                    current_task_str = f"Floor {st.assigned_floor}" if st.assigned_floor else "Available"
+
+                attendants_data.append({
+                    "id": st.id,
+                    "name": st.name,
+                    "floor": st.assigned_floor,
+                    "open_task_count": open_cnt,
+                    "availability": avail_status,
+                    "current_task": current_task_str,
+                })
+
+            # 7. Generate cards for each column
+            columns_cards: Dict[str, List[Dict[str, Any]]] = {
+                "unassigned": [],
+                "assigned": [],
+                "cleaning": [],
+                "inspection_required": [],
+                "completed": [],
+                "blocked": [],
+            }
+
+            overdue_active_rooms = set()
+            priority_active_rooms = []
+
+            for t in all_cleaning_tasks:
+                if t.room_id not in filtered_room_ids:
+                    continue
+
+                room = all_rooms_by_id.get(t.room_id)
+                room_type_str = room.room_type if room else "STANDARD"
+                expected_mins = DEFAULT_CLEANING_MINUTES_BY_ROOM_TYPE.get(
+                    (room_type_str or "").upper(), DEFAULT_CLEANING_MINUTES_FALLBACK
+                )
+
+                created_dt = t.created_at
+                if created_dt and created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+                created_iso = created_dt.isoformat() if created_dt else None
+
+                started_dt = created_dt if t.status in (TaskStatus.IN_PROGRESS.value, TaskStatus.COMPLETED.value) else None
+                started_iso = started_dt.isoformat() if started_dt else None
+
+                due_dt = (started_dt or created_dt) + timedelta(minutes=expected_mins) if (started_dt or t.status in (TaskStatus.ASSIGNED.value, TaskStatus.IN_PROGRESS.value)) else None
+                due_iso = due_dt.isoformat() if due_dt else None
+
+                elapsed_minutes = max(0, int((now_utc - (started_dt or created_dt)).total_seconds() / 60)) if (started_dt or created_dt) else None
+
+                is_active = t.status in (
+                    TaskStatus.PENDING.value,
+                    TaskStatus.ASSIGNED.value,
+                    TaskStatus.IN_PROGRESS.value,
+                    TaskStatus.ON_HOLD.value,
+                )
+                is_overdue = bool(is_active and due_dt and now_utc > due_dt)
+
+                if is_active and is_overdue and room:
+                    overdue_active_rooms.add(room.room_number)
+
+                next_g = room_next_guest_map.get(t.room_id)
+                is_vip_room = bool(next_g and next_g["is_vip"])
+
+                if is_active and next_g and next_g["priority_reason"] and room:
+                    priority_active_rooms.append({
+                        "room_number": room.room_number,
+                        "reason": next_g["priority_reason"],
+                    })
+
+                p_level = t.priority_level or "STANDARD"
+                p_label = {
+                    "URGENT": "Critical",
+                    "HIGH": "High",
+                    "STANDARD": "Medium",
+                    "NORMAL": "Low",
+                }.get(p_level.upper(), p_level.title())
+
+                staff_obj = staff_by_id.get(t.assigned_staff_id) if t.assigned_staff_id else None
+                assigned_staff_dict = {"id": staff_obj.id, "name": staff_obj.name} if staff_obj else None
+
+                blocked_msg = None
+                if t.status == TaskStatus.ON_HOLD.value:
+                    m_inc = maint_by_room.get(t.room_id)
+                    if m_inc:
+                        blocked_msg = f"Maintenance: {m_inc.description}"
+                    else:
+                        blocked_msg = "Needs a person"
+
+                card = {
+                    "id": str(t.id),
+                    "display_id": display_id_map.get(t.id, f"HK-{t.room_id:04d}"),
+                    "room_number": room.room_number if room else str(t.room_id),
+                    "floor": room.floor if room else 1,
+                    "room_type": room_type_str,
+                    "priority_label": p_label,
+                    "priority_level": p_level,
+                    "is_vip": is_vip_room,
+                    "next_guest": {
+                        "name": next_g["guest_name"],
+                        "arrival_time": next_g["check_in_time"],
+                        "label": next_g["arrival_label"],
+                        "is_vip": next_g["is_vip"],
+                    } if next_g else None,
+                    "description": t.notes or f"{room_type_str.title() if room_type_str else 'Standard'} room cleaning",
+                    "assigned_staff": assigned_staff_dict,
+                    "ai_assigned": True,
+                    "expected_minutes": expected_mins,
+                    "started_at": started_iso,
+                    "due_at": due_iso,
+                    "elapsed_minutes": elapsed_minutes,
+                    "is_overdue": is_overdue,
+                    "status": t.status,
+                    "blocked_reason": blocked_msg,
+                    "created_at": created_iso,
+                }
+
+                # Place into appropriate column
+                if t.status == TaskStatus.ON_HOLD.value:
+                    columns_cards["blocked"].append(card)
+                elif t.status == TaskStatus.COMPLETED.value:
+                    if created_dt and created_dt >= start_of_today_utc:
+                        columns_cards["completed"].append(card)
+                elif t.status == TaskStatus.IN_PROGRESS.value:
+                    columns_cards["cleaning"].append(card)
+                elif t.status == TaskStatus.ASSIGNED.value:
+                    columns_cards["assigned"].append(card)
+                elif t.status == TaskStatus.PENDING.value or card["assigned_staff"] is None:
+                    columns_cards["unassigned"].append(card)
+                else:
+                    columns_cards["unassigned"].append(card)
+
+            # 8. Add inspection cards from rooms in INSPECTION status (Rule 6)
+            rooms_in_inspection = [
+                r for r in filtered_rooms
+                if r.status == RoomStatus.INSPECTION.value
+            ]
+            for insp_room in rooms_in_inspection:
+                already_has_card = any(
+                    c["room_number"] == insp_room.room_number
+                    for c in columns_cards["inspection_required"]
+                )
+                if not already_has_card:
+                    next_g = room_next_guest_map.get(insp_room.id)
+                    is_vip_room = bool(next_g and next_g["is_vip"])
+                    exp_mins = DEFAULT_CLEANING_MINUTES_BY_ROOM_TYPE.get(
+                        (insp_room.room_type or "").upper(), DEFAULT_CLEANING_MINUTES_FALLBACK
+                    )
+                    columns_cards["inspection_required"].append({
+                        "id": None,
+                        "display_id": None,
+                        "room_number": insp_room.room_number,
+                        "floor": insp_room.floor,
+                        "room_type": insp_room.room_type or "STANDARD",
+                        "priority_label": "Medium",
+                        "priority_level": "STANDARD",
+                        "is_vip": is_vip_room,
+                        "next_guest": {
+                            "name": next_g["guest_name"],
+                            "arrival_time": next_g["check_in_time"],
+                            "label": next_g["arrival_label"],
+                            "is_vip": next_g["is_vip"],
+                        } if next_g else None,
+                        "description": "Room cleaned · ready for supervisor inspection",
+                        "assigned_staff": None,
+                        "ai_assigned": False,
+                        "expected_minutes": exp_mins,
+                        "started_at": None,
+                        "due_at": None,
+                        "elapsed_minutes": None,
+                        "is_overdue": False,
+                        "status": "INSPECTION",
+                        "blocked_reason": None,
+                        "created_at": None,
+                    })
+
+            # 9. Sort cards in each column (highest priority first, then oldest created_at)
+            priority_weight = {"URGENT": 0, "HIGH": 1, "STANDARD": 2, "NORMAL": 3}
+            for col_key in columns_cards:
+                columns_cards[col_key].sort(
+                    key=lambda c: (
+                        priority_weight.get(c.get("priority_level", "NORMAL"), 3),
+                        c.get("created_at") or "9999-99-99",
+                        str(c.get("room_number", "")),
+                    )
+                )
+
+            # 10. Columns structure matching prototype exactly
+            columns_list = [
+                {
+                    "key": "unassigned",
+                    "title": "Unassigned",
+                    "subtitle": "Waiting for an attendant",
+                    "count": len(columns_cards["unassigned"]),
+                    "cards": columns_cards["unassigned"],
+                },
+                {
+                    "key": "assigned",
+                    "title": "Assigned",
+                    "subtitle": "Queued with an attendant",
+                    "count": len(columns_cards["assigned"]),
+                    "cards": columns_cards["assigned"],
+                },
+                {
+                    "key": "cleaning",
+                    "title": "Cleaning",
+                    "subtitle": "In progress",
+                    "count": len(columns_cards["cleaning"]),
+                    "cards": columns_cards["cleaning"],
+                },
+                {
+                    "key": "inspection_required",
+                    "title": "Inspection Required",
+                    "subtitle": "Supervisor check",
+                    "count": len(columns_cards["inspection_required"]),
+                    "cards": columns_cards["inspection_required"],
+                },
+                {
+                    "key": "completed",
+                    "title": "Completed",
+                    "subtitle": "Today",
+                    "count": len(columns_cards["completed"]),
+                    "cards": columns_cards["completed"],
+                },
+                {
+                    "key": "blocked",
+                    "title": "Blocked",
+                    "subtitle": "Needs a person",
+                    "count": len(columns_cards["blocked"]),
+                    "cards": columns_cards["blocked"],
+                },
+            ]
+
+            # 11. Workload summary calculation
+            today_tasks = [
+                t for t in all_cleaning_tasks
+                if t.room_id in filtered_room_ids
+                and (
+                    (t.created_at and (t.created_at.replace(tzinfo=timezone.utc) if t.created_at.tzinfo is None else t.created_at) >= start_of_today_utc)
+                    or t.status in (
+                        TaskStatus.PENDING.value,
+                        TaskStatus.ASSIGNED.value,
+                        TaskStatus.IN_PROGRESS.value,
+                        TaskStatus.ON_HOLD.value,
+                    )
+                )
+            ]
+            still_open_tasks = [
+                t for t in today_tasks
+                if t.status in (
+                    TaskStatus.PENDING.value,
+                    TaskStatus.ASSIGNED.value,
+                    TaskStatus.IN_PROGRESS.value,
+                    TaskStatus.ON_HOLD.value,
+                )
+            ]
+
+            summary = {
+                "todays_workload": {
+                    "total": len(today_tasks),
+                    "still_open": len(still_open_tasks),
+                },
+                "available_cleaners": {
+                    "total": len(hk_staff_list),
+                    "available": available_cleaners_count,
+                    "busy": busy_cleaners_count,
+                    "off": off_cleaners_count,
+                },
+                "in_progress": {
+                    "total": len(columns_cards["cleaning"]),
+                    "awaiting_inspection": len(columns_cards["inspection_required"]),
+                },
+                "completed_today": len(columns_cards["completed"]),
+                "overdue": {
+                    "count": len(overdue_active_rooms),
+                    "rooms": sorted(list(overdue_active_rooms)),
+                },
+                "priority_rooms": {
+                    "count": len(priority_active_rooms),
+                    "rooms": priority_active_rooms,
+                },
+            }
+
+            return {
+                "summary": summary,
+                "columns": columns_list,
+                "attendants": attendants_data,
+                "generated_at": now_utc.isoformat(),
+            }
+
+    def log_activity(
+        self,
+        task_id: Optional[UUID],
+        room_id: Optional[int],
+        event_type: str,
+        title: str,
+        actor_name: str,
+        actor_role: str,
+        action: Optional[str] = None,
+        outcome: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
+        session=None,
+    ) -> TaskActivityEntity:
+        """Log a persistent task/room activity event to PostgreSQL."""
+        ts = timestamp or datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        act = TaskActivityEntity(
+            task_id=task_id,
+            room_id=room_id,
+            timestamp=ts,
+            event_type=event_type,
+            title=title,
+            actor_name=actor_name,
+            actor_role=actor_role,
+            action=action,
+            outcome=outcome,
+        )
+        if session is not None:
+            session.add(act)
+        else:
+            with self.session_factory() as sess:
+                sess.add(act)
+                sess.commit()
+        return act
+
+    def get_task_activities(self, task_id: UUID) -> List[dict]:
+        """Fetch all activity events for a task (newest first)."""
+        with self.session_factory() as session:
+            stmt = (
+                select(TaskActivityEntity)
+                .where(TaskActivityEntity.task_id == task_id)
+                .order_by(TaskActivityEntity.timestamp.desc(), TaskActivityEntity.id.desc())
+            )
+            entities = session.execute(stmt).scalars().all()
+            return [
+                {
+                    "id": str(e.id),
+                    "timestamp": (
+                        e.timestamp.replace(tzinfo=timezone.utc)
+                        if e.timestamp.tzinfo is None
+                        else e.timestamp
+                    ).isoformat(),
+                    "event_type": e.event_type,
+                    "title": e.title,
+                    "actor_name": e.actor_name,
+                    "actor_role": e.actor_role,
+                    "action": e.action,
+                    "outcome": e.outcome,
+                }
+                for e in entities
+            ]
+
+    def get_all_activities(
+        self,
+        limit: int = 200,
+        offset: int = 0,
+        kind: Optional[str] = None,
+        event_type: Optional[str] = None,
+        search: Optional[str] = None,
+    ) -> List[dict]:
+        """Fetch audit trail of all activity events across tasks and rooms (newest first)."""
+        with self.session_factory() as session:
+            stmt = (
+                select(
+                    TaskActivityEntity,
+                    RoomEntity.room_number,
+                )
+                .outerjoin(RoomEntity, TaskActivityEntity.room_id == RoomEntity.id)
+                .order_by(TaskActivityEntity.timestamp.desc(), TaskActivityEntity.id.desc())
+            )
+
+            rows = session.execute(stmt).all()
+            results = []
+            for row in rows:
+                e = row[0]
+                room_num = row[1] or (str(e.room_id) if e.room_id else None)
+                
+                role_upper = (e.actor_role or "").upper()
+                name_upper = (e.actor_name or "").upper()
+                if "AI" in role_upper or "AGENT" in role_upper or "AI" in name_upper or "AGENT" in name_upper:
+                    kind_val = "AI Agent"
+                elif "MANAGER" in role_upper:
+                    kind_val = "Manager"
+                elif "SUPERVISOR" in role_upper:
+                    kind_val = "Supervisor"
+                elif "SYSTEM" in role_upper:
+                    kind_val = "System"
+                else:
+                    kind_val = "Staff"
+
+                results.append({
+                    "id": str(e.id),
+                    "task_id": str(e.task_id) if e.task_id else None,
+                    "room_id": e.room_id,
+                    "room": room_num,
+                    "timestamp": (
+                        e.timestamp.replace(tzinfo=timezone.utc)
+                        if e.timestamp.tzinfo is None
+                        else e.timestamp
+                    ).isoformat(),
+                    "event_type": e.event_type,
+                    "type": e.title or e.event_type,
+                    "actor": e.actor_name,
+                    "actor_role": e.actor_role,
+                    "kind": kind_val,
+                    "action": e.action,
+                    "result": e.outcome,
+                })
+            return results
+
+    def start_task(
+        self,
+        task_id: UUID,
+        actor_name: str = settings.CURRENT_USER_NAME,
+        actor_role: str = settings.CURRENT_USER_ROLE,
+    ) -> OperationalTask:
+        """Start a task, set started_at, update room status, and log activity."""
+        with self.session_factory() as session:
+            task_entity = session.get(OperationalTaskEntity, task_id)
+            if not task_entity:
+                raise ValueError(f"Task with ID {task_id} not found.")
+
+            if task_entity.status == TaskStatus.IN_PROGRESS.value:
+                raise ValueError(f"Task {task_id} is already in progress.")
+            if task_entity.status in (TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value):
+                raise ValueError(f"Cannot start task {task_id} with status {task_entity.status}.")
+
+            now_utc = datetime.now(timezone.utc)
+            task_entity.status = TaskStatus.IN_PROGRESS.value
+            task_entity.started_at = now_utc
+
+            # Guarded early branch for GUEST_REQUEST
+            if (
+                task_entity.task_type == TaskType.GUEST_REQUEST.value
+                or task_entity.task_type == "GUEST_REQUEST"
+            ):
+                act_event = TaskActivityEntity(
+                    task_id=task_id,
+                    room_id=task_entity.room_id,
+                    timestamp=now_utc,
+                    event_type="TASK_STARTED",
+                    title="Delivery started",
+                    actor_name=actor_name,
+                    actor_role=actor_role,
+                    action=f"Started by {actor_name}",
+                    outcome="In progress",
+                )
+                session.add(act_event)
+                session.commit()
+                return self._to_pydantic_task(task_entity)
+
+            is_cleaning = (
+                task_entity.task_type == TaskType.ROOM_CLEANING.value
+                or "CLEAN" in str(task_entity.task_type).upper()
+            )
+            is_inspection = (
+                task_entity.task_type == TaskType.ROOM_INSPECTION.value
+                or "INSP" in str(task_entity.task_type).upper()
+            )
+
+            # Update room status
+            room_entity = session.get(RoomEntity, task_entity.room_id)
+            if room_entity:
+                if is_cleaning:
+                    if room_entity.status != RoomStatus.OCCUPIED.value:
+                        room_entity.status = RoomStatus.CLEANING.value
+                elif is_inspection:
+                    if room_entity.status != RoomStatus.OCCUPIED.value:
+                        room_entity.status = RoomStatus.INSPECTION.value
+                else:
+                    if room_entity.status != RoomStatus.OCCUPIED.value:
+                        room_entity.status = RoomStatus.MAINTENANCE.value
+
+            # Update maintenance incident if exists
+            if not is_cleaning and not is_inspection:
+                inc_stmt = select(MaintenanceIncidentEntity).where(
+                    MaintenanceIncidentEntity.operational_task_id == task_id
+                )
+                incidents = session.execute(inc_stmt).scalars().all()
+                for inc in incidents:
+                    inc.status = IncidentStatus.IN_PROGRESS.value
+
+            # Log activity event
+            if is_cleaning:
+                title = "Cleaning started"
+            elif is_inspection:
+                title = "Inspection started"
+            else:
+                title = "Repair started"
+            act_event = TaskActivityEntity(
+                task_id=task_id,
+                room_id=task_entity.room_id,
+                timestamp=now_utc,
+                event_type="TASK_STARTED",
+                title=title,
+                actor_name=actor_name,
+                actor_role=actor_role,
+                action=f"Started by {actor_name}",
+                outcome="In progress",
+            )
+            session.add(act_event)
+
+            session.commit()
+            return self._to_pydantic_task(task_entity)
+
+    def block_task(
+        self,
+        task_id: UUID,
+        reason: Optional[str] = None,
+        actor_name: str = settings.CURRENT_USER_NAME,
+        actor_role: str = settings.CURRENT_USER_ROLE,
+    ) -> OperationalTask:
+        """Mark a task as blocked (ON_HOLD) with an optional reason."""
+        with self.session_factory() as session:
+            task_entity = session.get(OperationalTaskEntity, task_id)
+            if not task_entity:
+                raise ValueError(f"Task with ID {task_id} not found.")
+
+            if task_entity.status in (TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value):
+                raise ValueError(f"Cannot block task {task_id} with status {task_entity.status}.")
+            if task_entity.status == TaskStatus.ON_HOLD.value:
+                raise ValueError(f"Task {task_id} is already blocked.")
+
+            task_entity.status = TaskStatus.ON_HOLD.value
+            reason_str = reason.strip() if reason and reason.strip() else "Marked blocked"
+            if task_entity.notes:
+                task_entity.notes = f"{task_entity.notes} | Blocked: {reason_str}"
+            else:
+                task_entity.notes = f"Blocked: {reason_str}"
+
+            act_event = TaskActivityEntity(
+                task_id=task_id,
+                room_id=task_entity.room_id,
+                timestamp=datetime.now(timezone.utc),
+                event_type="TASK_BLOCKED",
+                title="Task blocked",
+                actor_name=actor_name,
+                actor_role=actor_role,
+                action=f"Marked BLOCKED by {actor_name}",
+                outcome=reason_str,
+            )
+            session.add(act_event)
+
+            session.commit()
+            return self._to_pydantic_task(task_entity)
+
+    def escalate_task(
+        self,
+        task_id: UUID,
+        note: Optional[str] = None,
+        actor_name: str = settings.CURRENT_USER_NAME,
+        actor_role: str = settings.CURRENT_USER_ROLE,
+    ) -> OperationalTask:
+        """Record an escalation event for a task."""
+        with self.session_factory() as session:
+            task_entity = session.get(OperationalTaskEntity, task_id)
+            if not task_entity:
+                raise ValueError(f"Task with ID {task_id} not found.")
+
+            if task_entity.status in (TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value):
+                raise ValueError(f"Cannot escalate task {task_id} with status {task_entity.status}.")
+
+            note_str = note.strip() if note and note.strip() else "Supervisor notified"
+            act_event = TaskActivityEntity(
+                task_id=task_id,
+                room_id=task_entity.room_id,
+                timestamp=datetime.now(timezone.utc),
+                event_type="TASK_ESCALATED",
+                title="Escalation",
+                actor_name=actor_name,
+                actor_role=actor_role,
+                action=f"Escalated by {actor_name}",
+                outcome=note_str,
+            )
+            session.add(act_event)
+
+            session.commit()
+            return self._to_pydantic_task(task_entity)
+
+    def cancel_task(
+        self,
+        task_id: UUID,
+        actor_name: str = settings.CURRENT_USER_NAME,
+        actor_role: str = settings.CURRENT_USER_ROLE,
+    ) -> OperationalTask:
+        """Cancel a task, release staff, revert room status if needed, and log activity."""
+        with self.session_factory() as session:
+            task_entity = session.get(OperationalTaskEntity, task_id)
+            if not task_entity:
+                raise ValueError(f"Task with ID {task_id} not found.")
+
+            if task_entity.status in (TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value):
+                raise ValueError(f"Cannot cancel task {task_id} with status {task_entity.status}.")
+
+            task_entity.status = TaskStatus.CANCELLED.value
+
+            # Release staff
+            if task_entity.assigned_staff_id:
+                staff_entity = session.get(StaffEntity, task_entity.assigned_staff_id)
+                if staff_entity:
+                    remaining_staff_tasks_stmt = select(OperationalTaskEntity).where(
+                        OperationalTaskEntity.assigned_staff_id == staff_entity.id,
+                        OperationalTaskEntity.id != task_id,
+                        OperationalTaskEntity.status.in_([
+                            TaskStatus.PENDING.value,
+                            TaskStatus.ASSIGNED.value,
+                            TaskStatus.IN_PROGRESS.value,
+                        ]),
+                    )
+                    remaining_staff_tasks = list(session.execute(remaining_staff_tasks_stmt).scalars().all())
+                    staff_entity.active_task_count = len(remaining_staff_tasks)
+                    if not remaining_staff_tasks:
+                        staff_entity.is_available = True
+                        staff_entity.assigned_room_id = None
+                    else:
+                        staff_entity.assigned_room_id = remaining_staff_tasks[0].room_id
+
+            # Guarded early branch for GUEST_REQUEST
+            if (
+                task_entity.task_type == TaskType.GUEST_REQUEST.value
+                or task_entity.task_type == "GUEST_REQUEST"
+            ):
+                act_event = TaskActivityEntity(
+                    task_id=task_id,
+                    room_id=task_entity.room_id,
+                    timestamp=datetime.now(timezone.utc),
+                    event_type="TASK_CANCELLED",
+                    title="Task cancelled",
+                    actor_name=actor_name,
+                    actor_role=actor_role,
+                    action=f"Cancelled by {actor_name}",
+                    outcome="Task cancelled",
+                )
+                session.add(act_event)
+                self._assign_on_hold_guest_requests_in_session(session)
+                session.commit()
+                return self._to_pydantic_task(task_entity)
+
+            # Room status adjustment
+            is_cleaning = (
+                task_entity.task_type == TaskType.ROOM_CLEANING.value
+                or "CLEAN" in str(task_entity.task_type).upper()
+            )
+            room_entity = session.get(RoomEntity, task_entity.room_id)
+            if room_entity and room_entity.status != RoomStatus.OCCUPIED.value:
+                if is_cleaning and room_entity.status == RoomStatus.CLEANING.value:
+                    remaining_cleaning_stmt = select(OperationalTaskEntity).where(
+                        OperationalTaskEntity.room_id == task_entity.room_id,
+                        OperationalTaskEntity.id != task_id,
+                        OperationalTaskEntity.task_type == TaskType.ROOM_CLEANING.value,
+                        OperationalTaskEntity.status.in_([
+                            TaskStatus.ASSIGNED.value,
+                            TaskStatus.IN_PROGRESS.value,
+                        ]),
+                    )
+                    remaining_cleaning = list(session.execute(remaining_cleaning_stmt).scalars().all())
+                    if not remaining_cleaning:
+                        room_entity.status = RoomStatus.DIRTY.value
+
+            act_event = TaskActivityEntity(
+                task_id=task_id,
+                room_id=task_entity.room_id,
+                timestamp=datetime.now(timezone.utc),
+                event_type="TASK_CANCELLED",
+                title="Task cancelled",
+                actor_name=actor_name,
+                actor_role=actor_role,
+                action=f"Cancelled by {actor_name}",
+                outcome="Task cancelled",
+            )
+            session.add(act_event)
+            self._assign_on_hold_guest_requests_in_session(session)
+
+            session.commit()
+            return self._to_pydantic_task(task_entity)
+
+    def reassign_task(
+        self,
+        task_id: UUID,
+        staff_id: int,
+        actor_name: str = settings.CURRENT_USER_NAME,
+        actor_role: str = settings.CURRENT_USER_ROLE,
+    ) -> OperationalTask:
+        """Reassign task to another staff member with validation in one transaction."""
+        with self.session_factory() as session:
+            task_entity = session.get(OperationalTaskEntity, task_id)
+            if not task_entity:
+                raise ValueError(f"Task with ID {task_id} not found.")
+
+            if task_entity.status in (TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value):
+                raise ValueError(f"Cannot reassign task {task_id} with status {task_entity.status}.")
+
+            new_staff = session.get(StaffEntity, staff_id)
+            if not new_staff:
+                raise ValueError(f"Staff with ID {staff_id} not found.")
+
+            is_guest_request = (
+                task_entity.task_type == TaskType.GUEST_REQUEST.value
+                or task_entity.task_type == "GUEST_REQUEST"
+            )
+            is_cleaning = (
+                task_entity.task_type == TaskType.ROOM_CLEANING.value
+                or "CLEAN" in str(task_entity.task_type).upper()
+            )
+            if is_guest_request:
+                required_role = StaffRole.HOUSEKEEPING.value
+            elif is_cleaning:
+                required_role = StaffRole.HOUSEKEEPING.value
+            else:
+                required_role = StaffRole.MAINTENANCE.value
+            if new_staff.role != required_role:
+                raise ValueError(f"Staff {new_staff.name} role is {new_staff.role}, but task requires {required_role}.")
+
+            old_staff_id = task_entity.assigned_staff_id
+            old_staff = session.get(StaffEntity, old_staff_id) if old_staff_id else None
+            old_name = old_staff.name if old_staff else "Unassigned"
+
+            if old_staff and old_staff.id != staff_id:
+                # Decrement old staff workload
+                old_remaining_stmt = select(OperationalTaskEntity).where(
+                    OperationalTaskEntity.assigned_staff_id == old_staff.id,
+                    OperationalTaskEntity.id != task_id,
+                    OperationalTaskEntity.status.in_([
+                        TaskStatus.PENDING.value,
+                        TaskStatus.ASSIGNED.value,
+                        TaskStatus.IN_PROGRESS.value,
+                    ]),
+                )
+                old_remaining = list(session.execute(old_remaining_stmt).scalars().all())
+                old_staff.active_task_count = len(old_remaining)
+                if not old_remaining:
+                    old_staff.is_available = True
+                    old_staff.assigned_room_id = None
+                else:
+                    old_staff.assigned_room_id = old_remaining[0].room_id
+
+            # Assign new staff
+            task_entity.assigned_staff_id = staff_id
+            if task_entity.status == TaskStatus.PENDING.value:
+                task_entity.status = TaskStatus.ASSIGNED.value
+
+            new_staff.active_task_count += 1
+            new_staff.is_available = False
+            new_staff.assigned_room_id = task_entity.room_id
+
+            # Update maintenance incident technician if applicable
+            if not is_cleaning and not is_guest_request:
+                inc_stmt = select(MaintenanceIncidentEntity).where(
+                    MaintenanceIncidentEntity.operational_task_id == task_id
+                )
+                incidents = session.execute(inc_stmt).scalars().all()
+                for inc in incidents:
+                    inc.assigned_technician_id = staff_id
+
+            if is_guest_request:
+                title = "Housekeeper reassigned"
+            elif is_cleaning:
+                title = "Cleaner reassigned"
+            else:
+                title = "Technician reassigned"
+            act_event = TaskActivityEntity(
+                task_id=task_id,
+                room_id=task_entity.room_id,
+                timestamp=datetime.now(timezone.utc),
+                event_type="TASK_REASSIGNED",
+                title=title,
+                actor_name=actor_name,
+                actor_role=actor_role,
+                action=f"Reassigned from {old_name} → {new_staff.name} by {actor_name}",
+                outcome="Manual assignment",
+            )
+            session.add(act_event)
+
+            session.commit()
+            return self._to_pydantic_task(task_entity)
+
+    def change_task_priority(
+        self,
+        task_id: UUID,
+        priority_str: str,
+        actor_name: str = settings.CURRENT_USER_NAME,
+        actor_role: str = settings.CURRENT_USER_ROLE,
+    ) -> OperationalTask:
+        """Change task priority level and priority score, recorded as a human override."""
+        p_up = priority_str.strip().upper()
+        prio_map = {
+            "CRITICAL": (100, "URGENT", MaintenanceSeverity.CRITICAL),
+            "URGENT": (100, "URGENT", MaintenanceSeverity.CRITICAL),
+            "HIGH": (80, "HIGH", MaintenanceSeverity.HIGH),
+            "MEDIUM": (50, "STANDARD", MaintenanceSeverity.MEDIUM),
+            "STANDARD": (50, "STANDARD", MaintenanceSeverity.MEDIUM),
+            "LOW": (20, "NORMAL", MaintenanceSeverity.LOW),
+            "NORMAL": (20, "NORMAL", MaintenanceSeverity.LOW),
+        }
+        if p_up not in prio_map:
+            raise ValueError(f"Invalid priority '{priority_str}'. Must be HIGH, MEDIUM, or LOW.")
+
+        new_score, new_level, new_sev = prio_map[p_up]
+
+        with self.session_factory() as session:
+            task_entity = session.get(OperationalTaskEntity, task_id)
+            if not task_entity:
+                raise ValueError(f"Task with ID {task_id} not found.")
+
+            if task_entity.status in (TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value):
+                raise ValueError(f"Cannot change priority for task {task_id} with status {task_entity.status}.")
+
+            old_level = task_entity.priority_level
+            task_entity.priority_score = new_score
+            task_entity.priority_level = new_level
+
+            # Update maintenance incident severity if applicable
+            is_cleaning = (
+                task_entity.task_type == TaskType.ROOM_CLEANING.value
+                or "CLEAN" in str(task_entity.task_type).upper()
+            )
+            if not is_cleaning:
+                inc_stmt = select(MaintenanceIncidentEntity).where(
+                    MaintenanceIncidentEntity.operational_task_id == task_id
+                )
+                incidents = session.execute(inc_stmt).scalars().all()
+                for inc in incidents:
+                    inc.severity = new_sev.value
+
+            act_event = TaskActivityEntity(
+                task_id=task_id,
+                room_id=task_entity.room_id,
+                timestamp=datetime.now(timezone.utc),
+                event_type="PRIORITY_CHANGED",
+                title="Human override",
+                actor_name=actor_name,
+                actor_role=actor_role,
+                action=f"Priority changed from {old_level.upper()} → {new_level.upper()} by {actor_name}",
+                outcome="Human override recorded",
+            )
+            session.add(act_event)
+
+            session.commit()
+            return self._to_pydantic_task(task_entity)
+
+    def get_assignable_staff(self, task_id: UUID) -> List[dict]:
+        """List staff of the right role who can be assigned to the task with open task count."""
+        with self.session_factory() as session:
+            task_entity = session.get(OperationalTaskEntity, task_id)
+            if not task_entity:
+                raise ValueError(f"Task with ID {task_id} not found.")
+
+            room_entity = session.get(RoomEntity, task_entity.room_id)
+            room_floor = room_entity.floor if room_entity else None
+
+            is_guest_request = (
+                task_entity.task_type == TaskType.GUEST_REQUEST.value
+                or task_entity.task_type == "GUEST_REQUEST"
+            )
+            is_cleaning = (
+                task_entity.task_type == TaskType.ROOM_CLEANING.value
+                or "CLEAN" in str(task_entity.task_type).upper()
+            )
+            target_role = StaffRole.HOUSEKEEPING.value if (is_cleaning or is_guest_request) else StaffRole.MAINTENANCE.value
+
+            staff_entities = list(
+                session.execute(
+                    select(StaffEntity).where(StaffEntity.role == target_role)
+                ).scalars().all()
+            )
+
+            # Check required skill for maintenance
+            req_skill = None
+            if not is_cleaning and not is_guest_request:
+                inc_stmt = select(MaintenanceIncidentEntity).where(
+                    MaintenanceIncidentEntity.operational_task_id == task_id
+                )
+                inc = session.execute(inc_stmt).scalar_one_or_none()
+                if inc:
+                    from app.agents.maintenance_agent import MaintenanceAgent
+                    m_agent = MaintenanceAgent(self)
+                    req_skill = m_agent._get_required_skill(MaintenanceCategory(inc.category)).value
+
+            results = []
+            for s in staff_entities:
+                staff_pydantic = self._to_pydantic_staff(s)
+                skills_list = [sk.value if hasattr(sk, "value") else str(sk) for sk in staff_pydantic.skills]
+                has_req_skill = True if (req_skill is None or req_skill in skills_list) else False
+                is_current = (s.id == task_entity.assigned_staff_id)
+                is_same_floor = (room_floor is not None and s.assigned_floor == room_floor)
+
+                # Status label: Available, Busy, Offline
+                if not s.is_available and s.active_task_count == 0:
+                    avail_str = "Offline"
+                elif s.active_task_count > 0:
+                    avail_str = "Busy"
+                else:
+                    avail_str = "Available"
+
+                results.append({
+                    "id": s.id,
+                    "name": s.name,
+                    "role": s.role,
+                    "assigned_floor": s.assigned_floor,
+                    "is_available": s.is_available,
+                    "availability": avail_str,
+                    "active_task_count": s.active_task_count,
+                    "is_current_assignee": is_current,
+                    "is_same_floor": is_same_floor,
+                    "skills": skills_list,
+                    "has_required_skill": has_req_skill,
+                })
+
+            # Sort: current assignee first, then matching skill, then availability, then lowest workload, then same floor
+            results.sort(
+                key=lambda x: (
+                    0 if x["is_current_assignee"] else 1,
+                    0 if x["has_required_skill"] else 1,
+                    0 if x["availability"] in ("Available", "Busy") else 1,
+                    0 if x["is_same_floor"] else 1,
+                    x["active_task_count"],
+                    x["id"],
+                )
+            )
+            return results
+
+    def get_task_detail(self, task_id: UUID) -> dict:
+        """Fetch complete rich detail payload for the task drawer."""
+        with self.session_factory() as session:
+            # Deterministic sequence number partition
+            seq_subq = (
+                select(
+                    OperationalTaskEntity.id.label("task_id"),
+                    func.row_number()
+                    .over(
+                        partition_by=OperationalTaskEntity.task_type,
+                        order_by=[
+                            OperationalTaskEntity.created_at.asc(),
+                            OperationalTaskEntity.id.asc(),
+                        ],
+                    )
+                    .label("seq_num"),
+                )
+            ).subquery()
+
+            stmt = (
+                select(
+                    OperationalTaskEntity,
+                    seq_subq.c.seq_num,
+                    RoomEntity,
+                    StaffEntity,
+                    MaintenanceIncidentEntity,
+                )
+                .join(seq_subq, OperationalTaskEntity.id == seq_subq.c.task_id)
+                .outerjoin(RoomEntity, OperationalTaskEntity.room_id == RoomEntity.id)
+                .outerjoin(StaffEntity, OperationalTaskEntity.assigned_staff_id == StaffEntity.id)
+                .outerjoin(
+                    MaintenanceIncidentEntity,
+                    OperationalTaskEntity.id == MaintenanceIncidentEntity.operational_task_id,
+                )
+                .where(OperationalTaskEntity.id == task_id)
+            )
+
+            row = session.execute(stmt).first()
+            if not row:
+                raise ValueError(f"Task with ID {task_id} not found.")
+
+            task_ent = row[0]
+            seq_num = row[1] or 1
+            room_ent = row[2]
+            staff_ent = row[3]
+            inc_ent = row[4]
+
+            # Guarded early branch for GUEST_REQUEST
+            if (
+                task_ent.task_type == TaskType.GUEST_REQUEST.value
+                or task_ent.task_type == "GUEST_REQUEST"
+            ):
+                display_id = f"GR-{seq_num:04d}"
+                now_utc = datetime.now(timezone.utc)
+                created_dt = task_ent.created_at
+                if created_dt and created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+                created_iso = created_dt.isoformat() if created_dt else None
+
+                started_dt = task_ent.started_at
+                if started_dt and started_dt.tzinfo is None:
+                    started_dt = started_dt.replace(tzinfo=timezone.utc)
+                started_iso = started_dt.isoformat() if started_dt else None
+
+                elapsed_minutes = (
+                    max(0, int((now_utc - started_dt).total_seconds() / 60))
+                    if started_dt
+                    else None
+                )
+
+                room_type_str = room_ent.room_type if room_ent else "STANDARD"
+                p_level = str(task_ent.priority_level).upper()
+                priority_label_map = {
+                    "URGENT": "Critical",
+                    "CRITICAL": "Critical",
+                    "HIGH": "High",
+                    "STANDARD": "Medium",
+                    "MEDIUM": "Medium",
+                    "NORMAL": "Low",
+                    "LOW": "Low",
+                }
+                priority_label = priority_label_map.get(p_level, task_ent.priority_level)
+
+                st_val = str(task_ent.status).upper()
+                if st_val == "IN_PROGRESS":
+                    status_label = "Delivering"
+                elif st_val == "COMPLETED":
+                    status_label = "Delivered"
+                elif st_val == "PENDING":
+                    status_label = "Pending"
+                elif st_val == "ASSIGNED":
+                    status_label = "Assigned"
+                elif st_val == "ON_HOLD":
+                    status_label = "Blocked"
+                elif st_val == "CANCELLED":
+                    status_label = "Cancelled"
+                elif st_val == "FAILED":
+                    status_label = "Failed"
+                else:
+                    status_label = st_val.capitalize()
+
+                description = task_ent.notes or "Guest request"
+
+                next_guest_dict = None
+                if room_ent:
+                    res_stmt = (
+                        select(ReservationEntity, GuestEntity)
+                        .join(GuestEntity, ReservationEntity.guest_id == GuestEntity.id)
+                        .where(
+                            ReservationEntity.room_id == room_ent.id,
+                            ReservationEntity.check_out_time >= now_utc - timedelta(days=1),
+                        )
+                        .order_by(ReservationEntity.check_in_time.asc())
+                        .limit(1)
+                    )
+                    res_row = session.execute(res_stmt).first()
+                    if res_row:
+                        res_ent, g_ent = res_row
+                        ci_dt = res_ent.check_in_time
+                        if ci_dt and ci_dt.tzinfo is None:
+                            ci_dt = ci_dt.replace(tzinfo=timezone.utc)
+                        is_vip = bool(g_ent.guest_type and "VIP" in g_ent.guest_type.upper())
+                        diff_sec = (ci_dt - now_utc).total_seconds() if ci_dt else 0
+                        diff_min = int(diff_sec / 60)
+                        if diff_min > 0:
+                            if diff_min < 60:
+                                arr_label = f"arriving in {diff_min}m"
+                            else:
+                                h = diff_min // 60
+                                m = diff_min % 60
+                                arr_label = f"arriving in {h}h {m}m" if m > 0 else f"arriving in {h}h"
+                        else:
+                            arr_label = "arrived / in-house"
+
+                        next_guest_dict = {
+                            "name": f"{g_ent.first_name} {g_ent.last_name}".strip(),
+                            "is_vip": is_vip,
+                            "arrival_time": ci_dt.isoformat() if ci_dt else None,
+                            "label": arr_label,
+                        }
+
+                act_stmt = (
+                    select(TaskActivityEntity)
+                    .where(TaskActivityEntity.task_id == task_id)
+                    .order_by(TaskActivityEntity.timestamp.desc(), TaskActivityEntity.id.desc())
+                )
+                act_entities = list(session.execute(act_stmt).scalars().all())
+
+                activity_list = [
+                    {
+                        "id": str(a.id),
+                        "timestamp": (
+                            a.timestamp.replace(tzinfo=timezone.utc)
+                            if a.timestamp.tzinfo is None
+                            else a.timestamp
+                        ).isoformat(),
+                        "title": a.title,
+                        "actor_name": a.actor_name,
+                        "actor_role": a.actor_role,
+                        "action": a.action,
+                        "outcome": a.outcome,
+                    }
+                    for a in act_entities
+                ]
+
+                has_reassign = any(a.event_type == "TASK_REASSIGNED" for a in act_entities)
+                ai_assigned = not has_reassign
+                assigned_by = "Housekeeping Agent"
+
+                if st_val in (TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value, TaskStatus.FAILED.value):
+                    allowed_actions = []
+                elif st_val == TaskStatus.IN_PROGRESS.value:
+                    allowed_actions = ["complete", "block", "escalate", "cancel", "reassign", "priority"]
+                elif st_val == TaskStatus.ON_HOLD.value:
+                    allowed_actions = ["start", "escalate", "cancel", "reassign", "priority"]
+                elif st_val in (TaskStatus.ASSIGNED.value, TaskStatus.PENDING.value):
+                    allowed_actions = ["start", "block", "escalate", "cancel", "reassign", "priority"]
+                else:
+                    allowed_actions = ["start", "block", "escalate", "cancel", "reassign", "priority"]
+
+                return {
+                    "id": str(task_ent.id),
+                    "display_id": display_id,
+                    "task_type": task_ent.task_type,
+                    "type_label": "Guest request",
+                    "status": task_ent.status,
+                    "status_label": status_label,
+                    "priority_level": task_ent.priority_level,
+                    "priority_label": priority_label,
+                    "priority_score": task_ent.priority_score,
+                    "ai_assigned": ai_assigned,
+                    "assigned_by": assigned_by,
+                    "room": {
+                        "id": room_ent.id if room_ent else task_ent.room_id,
+                        "number": room_ent.room_number if room_ent else str(task_ent.room_id),
+                        "type": room_type_str,
+                        "floor": room_ent.floor if room_ent else 1,
+                        "status": room_ent.status if room_ent else "OCCUPIED",
+                    },
+                    "expected_minutes": 30,
+                    "created_at": created_iso,
+                    "started_at": started_iso,
+                    "elapsed_minutes": elapsed_minutes,
+                    "next_guest": next_guest_dict,
+                    "assigned_staff": {
+                        "id": staff_ent.id,
+                        "name": staff_ent.name,
+                        "role": staff_ent.role,
+                        "assigned_floor": staff_ent.assigned_floor,
+                    } if staff_ent else None,
+                    "description": description,
+                    "incident": None,
+                    "activity": activity_list,
+                    "allowed_actions": allowed_actions,
+                }
+
+            is_cleaning = (
+                task_ent.task_type == TaskType.ROOM_CLEANING.value
+                or "CLEAN" in str(task_ent.task_type).upper()
+            )
+            is_inspection = (
+                task_ent.task_type == TaskType.ROOM_INSPECTION.value
+                or "INSP" in str(task_ent.task_type).upper()
+            )
+            prefix = "INSP" if is_inspection else ("HK" if is_cleaning else "MT")
+            display_id = f"{prefix}-{seq_num:04d}"
+
+            now_utc = datetime.now(timezone.utc)
+
+            # Timestamps
+            created_dt = task_ent.created_at
+            if created_dt and created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            created_iso = created_dt.isoformat() if created_dt else None
+
+            started_dt = task_ent.started_at
+            if started_dt and started_dt.tzinfo is None:
+                started_dt = started_dt.replace(tzinfo=timezone.utc)
+            started_iso = started_dt.isoformat() if started_dt else None
+
+            # Elapsed minutes
+            elapsed_minutes = (
+                max(0, int((now_utc - started_dt).total_seconds() / 60))
+                if started_dt
+                else None
+            )
+
+            # Room type & Expected minutes
+            room_type_str = room_ent.room_type if room_ent else "STANDARD"
+            if is_cleaning:
+                expected_mins = DEFAULT_CLEANING_MINUTES_BY_ROOM_TYPE.get(
+                    (room_type_str or "").upper(), DEFAULT_CLEANING_MINUTES_FALLBACK
+                )
+            else:
+                expected_mins = inc_ent.sla_minutes if inc_ent and inc_ent.sla_minutes else 60
+
+            # Priority label
+            p_level = str(task_ent.priority_level).upper()
+            priority_label_map = {
+                "URGENT": "Critical",
+                "CRITICAL": "Critical",
+                "HIGH": "High",
+                "STANDARD": "Medium",
+                "MEDIUM": "Medium",
+                "NORMAL": "Low",
+                "LOW": "Low",
+            }
+            priority_label = priority_label_map.get(p_level, task_ent.priority_level)
+
+            # Status label
+            st_val = str(task_ent.status).upper()
+            if st_val == "IN_PROGRESS":
+                status_label = "Cleaning" if is_cleaning else "In repair"
+            elif st_val == "PENDING":
+                status_label = "Pending"
+            elif st_val == "ASSIGNED":
+                status_label = "Assigned"
+            elif st_val == "ON_HOLD":
+                status_label = "Blocked"
+            elif st_val == "COMPLETED":
+                status_label = "Completed"
+            elif st_val == "CANCELLED":
+                status_label = "Cancelled"
+            elif st_val == "FAILED":
+                status_label = "Failed"
+            else:
+                status_label = st_val.capitalize()
+
+            # Description
+            if is_inspection:
+                description = task_ent.notes or f"{room_type_str.title()} room inspection"
+            elif is_cleaning:
+                description = task_ent.notes or f"{room_type_str.title()} room cleaning"
+            else:
+                description = (
+                    inc_ent.description
+                    if inc_ent
+                    else (task_ent.notes or "Maintenance repair")
+                )
+
+            # SLA deadline for maintenance
+            sla_deadline_iso = None
+            if not is_cleaning and inc_ent and inc_ent.sla_minutes:
+                base_time = inc_ent.created_at or task_ent.created_at
+                if base_time:
+                    if base_time.tzinfo is None:
+                        base_time = base_time.replace(tzinfo=timezone.utc)
+                    deadline_dt = base_time + timedelta(minutes=inc_ent.sla_minutes)
+                    sla_deadline_iso = deadline_dt.isoformat()
+
+            # Next guest lookup
+            next_guest_dict = None
+            if room_ent:
+                res_stmt = (
+                    select(ReservationEntity, GuestEntity)
+                    .join(GuestEntity, ReservationEntity.guest_id == GuestEntity.id)
+                    .where(
+                        ReservationEntity.room_id == room_ent.id,
+                        ReservationEntity.check_out_time >= now_utc - timedelta(days=1),
+                    )
+                    .order_by(ReservationEntity.check_in_time.asc())
+                    .limit(1)
+                )
+                res_row = session.execute(res_stmt).first()
+                if res_row:
+                    res_ent, g_ent = res_row
+                    ci_dt = res_ent.check_in_time
+                    if ci_dt and ci_dt.tzinfo is None:
+                        ci_dt = ci_dt.replace(tzinfo=timezone.utc)
+                    is_vip = bool(g_ent.guest_type and "VIP" in g_ent.guest_type.upper())
+                    diff_sec = (ci_dt - now_utc).total_seconds() if ci_dt else 0
+                    diff_min = int(diff_sec / 60)
+                    if diff_min > 0:
+                        if diff_min < 60:
+                            arr_label = f"arriving in {diff_min}m"
+                        else:
+                            h = diff_min // 60
+                            m = diff_min % 60
+                            arr_label = f"arriving in {h}h {m}m" if m > 0 else f"arriving in {h}h"
+                    else:
+                        arr_label = "arrived / in-house"
+
+                    next_guest_dict = {
+                        "name": f"{g_ent.first_name} {g_ent.last_name}".strip(),
+                        "is_vip": is_vip,
+                        "arrival_time": ci_dt.isoformat() if ci_dt else None,
+                        "label": arr_label,
+                    }
+
+            # Fetch activity events for this task
+            act_stmt = (
+                select(TaskActivityEntity)
+                .where(TaskActivityEntity.task_id == task_id)
+                .order_by(TaskActivityEntity.timestamp.desc(), TaskActivityEntity.id.desc())
+            )
+            act_entities = list(session.execute(act_stmt).scalars().all())
+
+            activity_list = [
+                {
+                    "id": str(a.id),
+                    "timestamp": (
+                        a.timestamp.replace(tzinfo=timezone.utc)
+                        if a.timestamp.tzinfo is None
+                        else a.timestamp
+                    ).isoformat(),
+                    "title": a.title,
+                    "actor_name": a.actor_name,
+                    "actor_role": a.actor_role,
+                    "action": a.action,
+                    "outcome": a.outcome,
+                }
+                for a in act_entities
+            ]
+
+            # AI Assigned flag & assigned_by
+            has_reassign = any(a.event_type == "TASK_REASSIGNED" for a in act_entities)
+            ai_assigned = not has_reassign
+            if has_reassign:
+                # Find last reassign actor
+                last_reassign = next((a for a in act_entities if a.event_type == "TASK_REASSIGNED"), None)
+                assigned_by = last_reassign.actor_name if last_reassign else settings.CURRENT_USER_NAME
+            else:
+                assigned_by = "Room Readiness Agent" if is_inspection else ("Housekeeping Agent" if is_cleaning else "Maintenance Agent")
+
+            # Allowed actions based on status
+            if st_val in (TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value, TaskStatus.FAILED.value):
+                allowed_actions = []
+            elif is_inspection:
+                allowed_actions = ["complete", "reassign", "priority"]
+            elif st_val == TaskStatus.IN_PROGRESS.value:
+                allowed_actions = ["complete", "block", "escalate", "cancel", "reassign", "priority"]
+            elif st_val == TaskStatus.ON_HOLD.value:
+                allowed_actions = ["start", "escalate", "cancel", "reassign", "priority"]
+            elif st_val in (TaskStatus.ASSIGNED.value, TaskStatus.PENDING.value):
+                allowed_actions = ["start", "block", "escalate", "cancel", "reassign", "priority"]
+            else:
+                allowed_actions = ["start", "block", "escalate", "cancel", "reassign", "priority"]
+
+            return {
+                "id": str(task_ent.id),
+                "display_id": display_id,
+                "task_type": task_ent.task_type,
+                "type_label": "Inspection" if is_inspection else ("Cleaning" if is_cleaning else "Maintenance"),
+                "status": task_ent.status,
+                "status_label": status_label,
+                "priority_level": task_ent.priority_level,
+                "priority_label": priority_label,
+                "priority_score": task_ent.priority_score,
+                "ai_assigned": ai_assigned,
+                "assigned_by": assigned_by,
+                "room": {
+                    "id": room_ent.id if room_ent else task_ent.room_id,
+                    "number": room_ent.room_number if room_ent else str(task_ent.room_id),
+                    "type": room_type_str,
+                    "floor": room_ent.floor if room_ent else 1,
+                    "status": room_ent.status if room_ent else "DIRTY",
+                },
+                "expected_minutes": expected_mins,
+                "created_at": created_iso,
+                "started_at": started_iso,
+                "elapsed_minutes": elapsed_minutes,
+                "next_guest": next_guest_dict,
+                "assigned_staff": {
+                    "id": staff_ent.id,
+                    "name": staff_ent.name,
+                    "role": staff_ent.role,
+                    "assigned_floor": staff_ent.assigned_floor,
+                } if staff_ent else None,
+                "description": description,
+                "incident": {
+                    "category": inc_ent.category,
+                    "severity": inc_ent.severity,
+                    "sla_minutes": inc_ent.sla_minutes,
+                    "sla_deadline": sla_deadline_iso,
+                } if inc_ent else None,
+                "activity": activity_list,
+                "allowed_actions": allowed_actions,
+            }
+
+    def get_maintenance_board(
+        self,
+        tab: Optional[str] = "open",
+        floor: Optional[Union[int, str]] = None,
+        search: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Retrieve full Maintenance board payload with summary metrics, tab counts, issues, technicians, and warnings."""
+        hotel_tz = ZoneInfo("Asia/Kolkata")
+        now_utc = datetime.now(timezone.utc)
+        now_kolkata = now_utc.astimezone(hotel_tz)
+        today_start_kolkata = now_kolkata.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_utc = today_start_kolkata.astimezone(timezone.utc)
+
+        target_res_min = getattr(settings, "TARGET_RESOLUTION_MINUTES", 45)
+
+        with self.session_factory() as session:
+            # 1. Fetch all sequence numbers for display_id format (MT-0001)
+            seq_stmt = (
+                select(
+                    MaintenanceIncidentEntity.id,
+                    func.row_number().over(order_by=MaintenanceIncidentEntity.created_at.asc()).label("seq"),
+                )
+            )
+            seq_map = {row[0]: row[1] for row in session.execute(seq_stmt).all()}
+
+            # 2. Fetch all incidents with Room, Task, and Staff using real SQL joins
+            inc_query = (
+                select(
+                    MaintenanceIncidentEntity,
+                    OperationalTaskEntity,
+                    RoomEntity,
+                    StaffEntity,
+                )
+                .outerjoin(OperationalTaskEntity, MaintenanceIncidentEntity.operational_task_id == OperationalTaskEntity.id)
+                .join(RoomEntity, MaintenanceIncidentEntity.room_id == RoomEntity.id)
+                .outerjoin(StaffEntity, MaintenanceIncidentEntity.assigned_technician_id == StaffEntity.id)
+                .order_by(MaintenanceIncidentEntity.created_at.asc())
+            )
+            rows = session.execute(inc_query).all()
+
+            # 3. Fetch all maintenance technicians
+            tech_stmt = (
+                select(StaffEntity)
+                .where(StaffEntity.role == StaffRole.MAINTENANCE.value)
+                .order_by(StaffEntity.id.asc())
+            )
+            tech_entities = list(session.execute(tech_stmt).scalars().all())
+
+            # Parse all issues into structured objects
+            all_issues = []
+            open_count = 0
+            critical_count = 0
+            high_priority_count = 0
+            unassigned_count = 0
+            completed_count = 0
+            sla_breaches_today_count = 0
+            resolved_durations_today = []
+
+            for inc, task, room, tech in rows:
+                seq_num = seq_map.get(inc.id, 1)
+                display_id = f"MT-{seq_num:04d}"
+
+                created_dt = inc.created_at
+                if created_dt and created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+                created_iso = created_dt.isoformat() if created_dt else now_utc.isoformat()
+
+                sla_mins = inc.sla_minutes or 60
+                sla_deadline_dt = (created_dt or now_utc) + timedelta(minutes=sla_mins)
+                sla_deadline_iso = sla_deadline_dt.isoformat()
+
+                # Status determination
+                task_status = str(task.status).upper() if task else str(inc.status).upper()
+                is_completed = (
+                    task_status in (TaskStatus.COMPLETED.value, "RESOLVED", "DONE")
+                    or inc.status in (IncidentStatus.RESOLVED.value, "RESOLVED", "COMPLETED")
+                )
+                is_in_repair = task_status == TaskStatus.IN_PROGRESS.value
+                is_blocked = task_status in (TaskStatus.ON_HOLD.value, "BLOCKED")
+                is_unassigned = inc.assigned_technician_id is None or task is None or inc.status == IncidentStatus.ESCALATED.value
+
+                if is_completed:
+                    status_code = "COMPLETED"
+                    status_label = "Completed"
+                elif is_in_repair:
+                    status_code = "IN_PROGRESS"
+                    status_label = "In repair"
+                elif is_blocked:
+                    status_code = "ON_HOLD"
+                    status_label = "Blocked"
+                elif is_unassigned:
+                    status_code = "UNASSIGNED"
+                    status_label = "Unassigned"
+                else:
+                    status_code = "ASSIGNED"
+                    status_label = "Assigned"
+
+                # SLA breach calculation
+                resolved_dt = inc.resolved_at
+                if resolved_dt and resolved_dt.tzinfo is None:
+                    resolved_dt = resolved_dt.replace(tzinfo=timezone.utc)
+
+                if is_completed:
+                    is_breached = bool(resolved_dt and resolved_dt > sla_deadline_dt)
+                else:
+                    is_breached = bool(now_utc > sla_deadline_dt)
+
+                # Track metrics
+                is_active = not is_completed
+                sev_upper = str(inc.severity).upper()
+
+                if is_active:
+                    open_count += 1
+                    if sev_upper == "CRITICAL":
+                        critical_count += 1
+                    elif sev_upper == "HIGH":
+                        high_priority_count += 1
+                    if is_unassigned:
+                        unassigned_count += 1
+                else:
+                    completed_count += 1
+
+                # SLA breach today
+                is_today = (created_dt and created_dt >= today_start_utc) or (resolved_dt and resolved_dt >= today_start_utc)
+                if is_breached and is_today:
+                    sla_breaches_today_count += 1
+
+                # Average resolution calculation for today
+                if is_completed and resolved_dt and resolved_dt >= today_start_utc and created_dt:
+                    duration_min = (resolved_dt - created_dt).total_seconds() / 60.0
+                    if duration_min >= 0:
+                        resolved_durations_today.append(duration_min)
+
+                # Severity and Category labels
+                sev_label_map = {
+                    "CRITICAL": "Critical",
+                    "HIGH": "High",
+                    "MEDIUM": "Medium",
+                    "LOW": "Low",
+                }
+                sev_label = sev_label_map.get(sev_upper, "Normal")
+
+                cat_raw = str(inc.category).upper()
+                cat_label_map = {
+                    "HVAC": "HVAC",
+                    "PLUMBING": "Plumbing",
+                    "ELECTRICAL": "Electrical",
+                    "FURNITURE": "Furniture",
+                    "SAFETY": "Safety",
+                    "GENERAL": "General",
+                }
+                cat_label = cat_label_map.get(cat_raw, inc.category)
+
+                # Critical banner
+                banner_text = None
+                if sev_upper == "CRITICAL" and is_active:
+                    tech_name = tech.name if tech else "Engineering"
+                    supervisor_name = settings.DEFAULT_SUPERVISOR_NAME
+                    sec_ext = settings.HOTEL_SECURITY_EXTENSION
+                    banner_text = (
+                        f"Critical safety issue — emergency response active. {tech_name} assigned. "
+                        f"Escalation recorded in audit trail for {supervisor_name}. Call Security on ext. {sec_ext} if urgent."
+                    )
+
+                issue_dict = {
+                    "task_id": str(task.id) if task else None,
+                    "incident_id": str(inc.id),
+                    "display_id": display_id,
+                    "room": {
+                        "id": room.id,
+                        "number": room.room_number,
+                        "floor": room.floor,
+                        "type": room.room_type or "",
+                        "status": room.status or "DIRTY",
+                    },
+                    "description": inc.description,
+                    "category": inc.category,
+                    "category_label": cat_label,
+                    "severity": inc.severity,
+                    "severity_label": sev_label,
+                    "sla_minutes": sla_mins,
+                    "sla_deadline": sla_deadline_iso,
+                    "is_breached": is_breached,
+                    "ai_assigned": True,
+                    "flags": {
+                        "default": bool(inc.is_fallback),
+                        "needs_review": bool(inc.needs_human_review),
+                    },
+                    "banner": banner_text,
+                    "assigned_technician": {
+                        "id": tech.id,
+                        "name": tech.name,
+                        "role": tech.role,
+                        "assigned_floor": tech.assigned_floor,
+                    } if tech else None,
+                    "status": status_code,
+                    "status_label": status_label,
+                    "created_at": created_iso,
+                    "_sev_rank": {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}.get(sev_upper, 4),
+                    "_deadline_ts": sla_deadline_dt.timestamp(),
+                    "_is_active": is_active,
+                    "_is_critical": (sev_upper == "CRITICAL" and is_active),
+                    "_is_unassigned": (is_unassigned and is_active),
+                }
+                all_issues.append(issue_dict)
+
+            # 4. Filter issues by requested tab, floor, and search
+            filtered_issues = all_issues
+            tab_clean = (tab or "open").strip().lower()
+
+            if tab_clean == "critical":
+                filtered_issues = [i for i in filtered_issues if i["_is_critical"]]
+            elif tab_clean == "unassigned":
+                filtered_issues = [i for i in filtered_issues if i["_is_unassigned"]]
+            elif tab_clean == "completed":
+                filtered_issues = [i for i in filtered_issues if not i["_is_active"]]
+            else:  # default 'open'
+                filtered_issues = [i for i in filtered_issues if i["_is_active"]]
+
+            # Floor filter
+            if floor is not None and str(floor).lower() not in ("all", ""):
+                try:
+                    fl_int = int(floor)
+                    filtered_issues = [i for i in filtered_issues if i["room"]["floor"] == fl_int]
+                except ValueError:
+                    pass
+
+            # Search filter
+            if search and search.strip():
+                s_lower = search.strip().lower()
+                filtered_issues = [
+                    i for i in filtered_issues
+                    if s_lower in i["display_id"].lower()
+                    or s_lower in i["room"]["number"].lower()
+                    or s_lower in (i["description"] or "").lower()
+                    or (i["assigned_technician"] and s_lower in i["assigned_technician"]["name"].lower())
+                ]
+
+            # Sort by severity rank (CRITICAL -> HIGH -> MEDIUM -> LOW) then SLA deadline ascending
+            filtered_issues.sort(key=lambda x: (x["_sev_rank"], x["_deadline_ts"]))
+
+            # Clean internal sorting keys
+            clean_issues = []
+            for item in filtered_issues:
+                out = dict(item)
+                out.pop("_sev_rank", None)
+                out.pop("_deadline_ts", None)
+                out.pop("_is_active", None)
+                out.pop("_is_critical", None)
+                out.pop("_is_unassigned", None)
+                clean_issues.append(out)
+
+            # 5. Build Technicians list & counts
+            technicians_list = []
+            available_tech_count = 0
+            busy_tech_count = 0
+
+            # Map open tasks by staff ID
+            open_tasks_by_staff: Dict[int, List[Dict[str, Any]]] = {}
+            for issue in all_issues:
+                if issue["_is_active"] and issue["assigned_technician"]:
+                    t_id = issue["assigned_technician"]["id"]
+                    open_tasks_by_staff.setdefault(t_id, []).append(issue)
+
+            for tech in tech_entities:
+                tech_skills = tech.skills or []
+                if not tech_skills:
+                    if tech.id == 301:
+                        tech_skills = ["HVAC", "GENERAL"]
+                    elif tech.id == 302:
+                        tech_skills = ["ELECTRICAL", "PLUMBING", "GENERAL"]
+                    elif tech.id == 303:
+                        tech_skills = ["PLUMBING", "GENERAL"]
+
+                assigned_active = open_tasks_by_staff.get(tech.id, [])
+                queued_count = len(assigned_active)
+                in_repair_task = next((t for t in assigned_active if t["status"] == "IN_PROGRESS"), None)
+
+                avail_status_raw = (tech.availability_status or "AVAILABLE").upper()
+
+                if in_repair_task:
+                    avail_status_upper = "BUSY"
+                    queued_non_in_prog = len([t for t in assigned_active if t["status"] != "IN_PROGRESS"])
+                    avail_note = f"Repairing Room {in_repair_task['room']['number']}"
+                    if queued_non_in_prog > 0:
+                        avail_note += f" · {queued_non_in_prog} queued"
+                elif avail_status_raw in ("ON_LEAVE", "OFFLINE"):
+                    avail_status_upper = avail_status_raw
+                    avail_note = tech.availability_note or ("On leave today" if avail_status_raw == "ON_LEAVE" else "Offline until 14:00")
+                else:
+                    avail_status_upper = "AVAILABLE"
+                    if queued_count == 0:
+                        avail_note = "Free for next issue"
+                    elif queued_count == 1:
+                        avail_note = "1 queued"
+                    else:
+                        avail_note = f"{queued_count} queued"
+
+                if avail_status_upper == "AVAILABLE":
+                    available_tech_count += 1
+                elif avail_status_upper == "BUSY":
+                    busy_tech_count += 1
+
+
+                technicians_list.append({
+                    "id": tech.id,
+                    "name": tech.name,
+                    "skills": tech_skills,
+                    "floor": tech.assigned_floor,
+                    "availability": avail_status_upper,
+                    "availability_note": avail_note,
+                    "queued_count": len([t for t in assigned_active if t["status"] != "IN_PROGRESS"]),
+                })
+
+            # 6. Calculate Dynamic System Warnings
+            warnings_list = []
+            open_active_issues = [i for i in all_issues if i["_is_active"]]
+
+            # Check if any open issue needs PLUMBING skill while all plumbers are offline/on_leave
+            active_skills_on_shift = set()
+            for t in technicians_list:
+                if t["availability"] in ("AVAILABLE", "BUSY"):
+                    for sk in t["skills"]:
+                        active_skills_on_shift.add(str(sk).upper())
+
+            for issue in open_active_issues:
+                cat_upper = str(issue["category"]).upper()
+                if cat_upper in ("PLUMBING",) and "PLUMBING" not in active_skills_on_shift:
+                    w_msg = f"No plumber on shift until 14:00. Plumbing issues are escalated to {settings.DEFAULT_SUPERVISOR_NAME}."
+                    if w_msg not in warnings_list:
+                        warnings_list.append(w_msg)
+                elif cat_upper in ("HVAC",) and "HVAC" not in active_skills_on_shift:
+                    w_msg = "No HVAC technician currently on shift. HVAC issues are queued with supervisor."
+                    if w_msg not in warnings_list:
+                        warnings_list.append(w_msg)
+
+            # 7. Average resolution metrics
+            avg_min = round(sum(resolved_durations_today) / len(resolved_durations_today)) if resolved_durations_today else None
+
+            return {
+                "summary": {
+                    "open_issues": open_count,
+                    "critical": critical_count,
+                    "high_priority": high_priority_count,
+                    "technicians": {
+                        "available": available_tech_count,
+                        "busy": busy_tech_count,
+                        "total": len(tech_entities),
+                    },
+                    "sla_breaches_today": sla_breaches_today_count,
+                    "avg_resolution": {
+                        "minutes": avg_min,
+                        "target_minutes": target_res_min,
+                    },
+                },
+                "tab_counts": {
+                    "open": open_count,
+                    "critical": critical_count,
+                    "unassigned": unassigned_count,
+                    "completed": completed_count,
+                },
+                "issues": clean_issues,
+                "technicians": technicians_list,
+                "warnings": warnings_list,
+            }
+
+    def get_maintenance_detail(self, identifier: Union[UUID, str]) -> Dict[str, Any]:
+        """Retrieve detailed maintenance issue payload by incident ID or task ID."""
+        try:
+            uid = UUID(str(identifier))
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid UUID format for maintenance issue identifier: '{identifier}'.")
+
+        now_utc = datetime.now(timezone.utc)
+
+        with self.session_factory() as session:
+            # 1. Find incident by incident.id or operational_task_id
+            stmt = (
+                select(
+                    MaintenanceIncidentEntity,
+                    OperationalTaskEntity,
+                    RoomEntity,
+                    StaffEntity,
+                )
+                .outerjoin(OperationalTaskEntity, MaintenanceIncidentEntity.operational_task_id == OperationalTaskEntity.id)
+                .join(RoomEntity, MaintenanceIncidentEntity.room_id == RoomEntity.id)
+                .outerjoin(StaffEntity, MaintenanceIncidentEntity.assigned_technician_id == StaffEntity.id)
+                .where(
+                    or_(
+                        MaintenanceIncidentEntity.id == uid,
+                        MaintenanceIncidentEntity.operational_task_id == uid,
+                    )
+                )
+            )
+            row = session.execute(stmt).first()
+            if not row:
+                raise ValueError(f"Maintenance issue with ID {identifier} not found.")
+
+            inc_ent, task_ent, room_ent, tech_ent = row
+
+            # 2. Fetch reporter staff
+            reporter_ent = None
+            if inc_ent.reported_by_staff_id:
+                reporter_ent = session.get(StaffEntity, inc_ent.reported_by_staff_id)
+
+            # 3. Compute deterministic sequence display_id (MT-0001)
+            seq_stmt = select(func.count(MaintenanceIncidentEntity.id)).where(
+                MaintenanceIncidentEntity.created_at <= inc_ent.created_at
+            )
+            seq_num = session.scalar(seq_stmt) or 1
+            display_id = f"MT-{seq_num:04d}"
+
+            # 4. Dates & SLA calculation
+            created_dt = inc_ent.created_at
+            if created_dt and created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            created_iso = created_dt.isoformat() if created_dt else now_utc.isoformat()
+
+            sla_mins = inc_ent.sla_minutes or 60
+            deadline_dt = (created_dt or now_utc) + timedelta(minutes=sla_mins)
+            deadline_iso = deadline_dt.isoformat()
+
+            resolved_dt = inc_ent.resolved_at
+            if resolved_dt and resolved_dt.tzinfo is None:
+                resolved_dt = resolved_dt.replace(tzinfo=timezone.utc)
+
+            task_status = str(task_ent.status).upper() if task_ent else str(inc_ent.status).upper()
+            is_completed = (
+                task_status in (TaskStatus.COMPLETED.value, "RESOLVED", "DONE")
+                or inc_ent.status in (IncidentStatus.RESOLVED.value, "RESOLVED", "COMPLETED")
+            )
+            is_in_repair = task_status == TaskStatus.IN_PROGRESS.value
+            is_blocked = task_status in (TaskStatus.ON_HOLD.value, "BLOCKED")
+            is_unassigned = inc_ent.assigned_technician_id is None or task_ent is None or inc_ent.status == IncidentStatus.ESCALATED.value
+
+            if is_completed:
+                status_code = "COMPLETED"
+                status_label = "Completed"
+            elif is_in_repair:
+                status_code = "IN_PROGRESS"
+                status_label = "In repair"
+            elif is_blocked:
+                status_code = "ON_HOLD"
+                status_label = "Blocked"
+            elif is_unassigned:
+                status_code = "UNASSIGNED"
+                status_label = "Unassigned"
+            else:
+                status_code = "ASSIGNED"
+                status_label = "Assigned"
+
+            if is_completed:
+                is_breached = bool(resolved_dt and resolved_dt > deadline_dt)
+                remaining_sec = 0
+                progress_pct = 100.0
+            else:
+                is_breached = bool(now_utc > deadline_dt)
+                remaining_sec = max(0, int((deadline_dt - now_utc).total_seconds()))
+                elapsed_sec = (now_utc - (created_dt or now_utc)).total_seconds()
+                progress_pct = min(100.0, max(0.0, (elapsed_sec / (sla_mins * 60)) * 100))
+
+            # 5. Check if guest in room
+            is_occupied = (room_ent.status and room_ent.status.upper() == "OCCUPIED")
+            guest_in_room = is_occupied
+
+            # 6. Critical alert banner or No technician banner
+            alert_dict = None
+            sev_upper = str(inc_ent.severity).upper()
+            if sev_upper == "CRITICAL" and (bool(inc_ent.safety_rule_applied) or inc_ent.decision_source == "HUMAN_OVERRIDE") and not is_completed:
+                tech_name = tech_ent.name if tech_ent else "Engineering"
+                supervisor_name = settings.DEFAULT_SUPERVISOR_NAME
+                sec_ext = settings.HOTEL_SECURITY_EXTENSION
+                alert_dict = {
+                    "title": "Critical safety issue — emergency response active",
+                    "text": (
+                        f"{tech_name} assigned. Escalation recorded in audit trail for {supervisor_name}. "
+                        f"If guests are at risk, relocate immediately and contact Security on ext. {sec_ext}."
+                    ),
+                }
+            elif is_unassigned and not is_completed:
+                alert_dict = {
+                    "title": "No technician available",
+                    "text": (
+                        f"No technician currently available with required {inc_ent.category} skill. "
+                        f"Issue escalated to {settings.DEFAULT_SUPERVISOR_NAME} and remains queued."
+                    ),
+                }
+
+            # 7. Audit trail from task_activities
+            activity_list = []
+            target_task_id = task_ent.id if task_ent else None
+            if target_task_id:
+                act_stmt = (
+                    select(TaskActivityEntity)
+                    .where(TaskActivityEntity.task_id == target_task_id)
+                    .order_by(TaskActivityEntity.timestamp.desc(), TaskActivityEntity.id.desc())
+                )
+                act_entities = list(session.execute(act_stmt).scalars().all())
+                activity_list = [
+                    {
+                        "id": str(a.id),
+                        "timestamp": (
+                            a.timestamp.replace(tzinfo=timezone.utc)
+                            if a.timestamp.tzinfo is None
+                            else a.timestamp
+                        ).isoformat(),
+                        "title": a.title,
+                        "actor_name": a.actor_name,
+                        "actor_role": a.actor_role,
+                        "action": a.action,
+                        "outcome": a.outcome,
+                    }
+                    for a in act_entities
+                ]
+
+            # 8. Allowed actions
+            if is_completed:
+                allowed_actions = []
+            elif is_in_repair:
+                allowed_actions = ["complete", "block", "escalate", "reassign", "override_classification"]
+            elif is_blocked:
+                allowed_actions = ["start", "escalate", "reassign", "override_classification"]
+            elif is_unassigned:
+                allowed_actions = ["reassign", "escalate", "override_classification"]
+            else:  # Assigned
+                allowed_actions = ["start", "complete", "block", "escalate", "reassign", "override_classification"]
+
+            # Severity label map
+            sev_label_map = {
+                "CRITICAL": "Critical",
+                "HIGH": "High",
+                "MEDIUM": "Medium",
+                "LOW": "Low",
+            }
+            sev_label = sev_label_map.get(sev_upper, inc_ent.severity)
+
+            cat_raw = str(inc_ent.category).upper()
+            cat_label_map = {
+                "HVAC": "HVAC",
+                "PLUMBING": "Plumbing",
+                "ELECTRICAL": "Electrical",
+                "FURNITURE": "Furniture",
+                "SAFETY": "Safety",
+                "GENERAL": "General",
+            }
+            cat_label = cat_label_map.get(cat_raw, inc_ent.category)
+
+            # Technician payload
+            tech_dict = None
+            if tech_ent:
+                skills_list = tech_ent.skills or []
+                if not skills_list:
+                    if tech_ent.id == 301:
+                        skills_list = ["HVAC", "GENERAL"]
+                    elif tech_ent.id == 302:
+                        skills_list = ["ELECTRICAL", "PLUMBING", "GENERAL"]
+                    elif tech_ent.id == 303:
+                        skills_list = ["PLUMBING", "GENERAL"]
+
+                # Fetch active tasks of technician
+                tech_tasks_stmt = select(OperationalTaskEntity).where(
+                    OperationalTaskEntity.assigned_staff_id == tech_ent.id,
+                    OperationalTaskEntity.status.in_([
+                        TaskStatus.PENDING.value,
+                        TaskStatus.ASSIGNED.value,
+                        TaskStatus.IN_PROGRESS.value,
+                    ]),
+                )
+                tech_tasks = list(session.execute(tech_tasks_stmt).scalars().all())
+                tech_in_prog = next((t for t in tech_tasks if t.status == TaskStatus.IN_PROGRESS.value), None)
+
+                if tech_in_prog:
+                    tech_avail = "BUSY"
+                    r_ent = session.get(RoomEntity, tech_in_prog.room_id)
+                    r_num = r_ent.room_number if r_ent else str(tech_in_prog.room_id)
+                    tech_note = f"Repairing Room {r_num}"
+                else:
+                    tech_avail = "AVAILABLE"
+                    queued_cnt = len(tech_tasks)
+                    if queued_cnt == 0:
+                        tech_note = "Free for next issue"
+                    elif queued_cnt == 1:
+                        tech_note = "1 queued"
+                    else:
+                        tech_note = f"{queued_cnt} queued"
+
+                tech_dict = {
+                    "id": tech_ent.id,
+                    "name": tech_ent.name,
+                    "role": tech_ent.role,
+                    "skills": skills_list,
+                    "availability": tech_avail,
+                    "availability_note": tech_note,
+                    "queued_count": len([t for t in tech_tasks if t.status != TaskStatus.IN_PROGRESS.value]),
+                    "ai_assigned": True,
+                }
+
+            return {
+                "id": str(inc_ent.id),
+                "task_id": str(task_ent.id) if task_ent else None,
+                "display_id": display_id,
+                "header": {
+                    "display_id": display_id,
+                    "room_number": room_ent.room_number,
+                    "room_type": room_ent.room_type or "Room",
+                    "floor": room_ent.floor,
+                    "status": status_code,
+                    "status_label": status_label,
+                    "severity": inc_ent.severity,
+                    "severity_label": sev_label,
+                    "category": inc_ent.category,
+                    "category_label": cat_label,
+                    "reported_by": {
+                        "id": reporter_ent.id if reporter_ent else inc_ent.reported_by_staff_id,
+                        "name": reporter_ent.name if reporter_ent else (f"Staff #{inc_ent.reported_by_staff_id}" if inc_ent.reported_by_staff_id else "Amit Shah"),
+                        "role": reporter_ent.role if reporter_ent else ("HOUSEKEEPING" if inc_ent.reported_by_staff_id else "MANAGER"),
+                    },
+                    "reported_at": created_iso,
+                    "guest_in_room": guest_in_room,
+                },
+                "alert": alert_dict,
+                "reported_problem": inc_ent.description,
+                "ai_decision": {
+                    "category": inc_ent.category,
+                    "category_reason": inc_ent.category_reason,
+                    "severity": inc_ent.severity,
+                    "severity_reason": inc_ent.severity_reason,
+                    "decision_source": inc_ent.decision_source or "RULE_TABLE",
+                    "confidence": inc_ent.confidence_score,
+                    "safety_rule_applied": bool(inc_ent.safety_rule_applied),
+                    "safety_rule_text": inc_ent.safety_rule_text,
+                    "sla_minutes": sla_mins,
+                    "respond_by": deadline_iso,
+                    "technician": {
+                        "id": tech_ent.id,
+                        "name": tech_ent.name,
+                        "role": tech_ent.role,
+                    } if tech_ent else None,
+                    "technician_reason": inc_ent.technician_match_reason,
+                    "decided_by": "Maintenance Agent",
+                    "decided_at": created_iso,
+                    "is_default": bool(inc_ent.is_fallback),
+                    "needs_review": bool(inc_ent.needs_human_review),
+                    "blocks_housekeeping": (
+                        bool(inc_ent.blocks_housekeeping)
+                        if inc_ent.blocks_housekeeping is not None
+                        else (bool(inc_ent.affects_room_readiness) if inc_ent.affects_room_readiness is not None else True)
+                    ),
+                    "housekeeping_hold_reason": (
+                        inc_ent.housekeeping_hold_reason
+                        or ("Requires maintenance before cleaning" if (inc_ent.blocks_housekeeping or inc_ent.affects_room_readiness) else "Minor issue does not affect room cleaning")
+                    ),
+                },
+
+                "sla": {
+                    "deadline": deadline_iso,
+                    "minutes_total": sla_mins,
+                    "remaining_seconds": remaining_sec,
+                    "is_breached": is_breached,
+                    "progress_percent": round(progress_pct, 1),
+                },
+                "technician": tech_dict,
+                "audit_trail": activity_list,
+                "allowed_actions": allowed_actions,
+            }
+
+    def override_maintenance_classification(
+        self,
+        identifier: Union[UUID, str],
+        category: Optional[str] = None,
+        severity: Optional[str] = None,
+        reason: Optional[str] = None,
+        staff_id: Optional[int] = None,
+        blocks_housekeeping: Optional[bool] = None,
+        actor_name: str = settings.CURRENT_USER_NAME,
+        actor_role: str = settings.CURRENT_USER_ROLE,
+    ) -> Dict[str, Any]:
+        """Override AI classification for a maintenance incident with atomic persistence."""
+        try:
+            uid = UUID(str(identifier))
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid UUID format for maintenance issue identifier: '{identifier}'.")
+
+        now_utc = datetime.now(timezone.utc)
+
+        with self.session_factory() as session:
+            # 1. Find incident
+            stmt = (
+                select(MaintenanceIncidentEntity, OperationalTaskEntity)
+                .outerjoin(OperationalTaskEntity, MaintenanceIncidentEntity.operational_task_id == OperationalTaskEntity.id)
+                .where(
+                    or_(
+                        MaintenanceIncidentEntity.id == uid,
+                        MaintenanceIncidentEntity.operational_task_id == uid,
+                    )
+                )
+            )
+            row = session.execute(stmt).first()
+            if not row:
+                raise ValueError(f"Maintenance issue with ID {identifier} not found.")
+
+            inc_ent, task_ent = row
+
+            if inc_ent.status == IncidentStatus.RESOLVED.value:
+                raise ValueError(f"Cannot override classification for resolved incident {identifier}.")
+
+            old_cat = inc_ent.category
+            old_sev = inc_ent.severity
+
+            # Determine actor info
+            actual_actor_name = actor_name
+            actual_actor_role = actor_role
+            if staff_id:
+                staff_ent = session.get(StaffEntity, staff_id)
+                if staff_ent:
+                    actual_actor_name = staff_ent.name
+                    actual_actor_role = staff_ent.role
+
+            # 2. Update category if provided
+            cat_changed = False
+            if category:
+                cat_clean = category.strip().upper()
+                valid_cats = [c.value for c in MaintenanceCategory]
+                if cat_clean not in valid_cats:
+                    raise ValueError(f"Invalid category '{category}'. Must be one of {valid_cats}.")
+                if cat_clean != inc_ent.category:
+                    inc_ent.category = cat_clean
+                    cat_changed = True
+
+            # 3. Update severity & recalculate SLA if provided
+            sev_changed = False
+            if severity:
+                sev_clean = severity.strip().upper()
+                valid_sevs = [s.value for s in MaintenanceSeverity]
+                if sev_clean not in valid_sevs:
+                    raise ValueError(f"Invalid severity '{severity}'. Must be one of {valid_sevs}.")
+
+                if sev_clean != inc_ent.severity:
+                    inc_ent.severity = sev_clean
+                    sev_changed = True
+
+                    # Recalculate SLA based on new severity
+                    sla_map = {
+                        MaintenanceSeverity.CRITICAL.value: 30,
+                        MaintenanceSeverity.HIGH.value: 60,
+                        MaintenanceSeverity.MEDIUM.value: 120,
+                        MaintenanceSeverity.LOW.value: 240,
+                    }
+                    inc_ent.sla_minutes = sla_map.get(sev_clean, 60)
+
+                    # Update priority on operational task if exists
+                    if task_ent:
+                        prio_map = {
+                            MaintenanceSeverity.CRITICAL.value: (100, "URGENT"),
+                            MaintenanceSeverity.HIGH.value: (80, "HIGH"),
+                            MaintenanceSeverity.MEDIUM.value: (50, "STANDARD"),
+                            MaintenanceSeverity.LOW.value: (20, "NORMAL"),
+                        }
+                        p_score, p_level = prio_map.get(sev_clean, (50, "STANDARD"))
+                        task_ent.priority_score = p_score
+                        task_ent.priority_level = p_level
+
+            # Re-evaluate blocks_housekeeping
+            from app.config import evaluate_blocks_housekeeping
+            if blocks_housekeeping is not None:
+                inc_ent.blocks_housekeeping = bool(blocks_housekeeping)
+                inc_ent.housekeeping_hold_reason = reason or "Manager override"
+            else:
+                eval_blocks, eval_reason = evaluate_blocks_housekeeping(
+                    category=inc_ent.category,
+                    severity=inc_ent.severity,
+                    description=inc_ent.description or "",
+                    is_safety_rule_applied=(inc_ent.severity == "CRITICAL"),
+                )
+                inc_ent.blocks_housekeeping = eval_blocks
+                inc_ent.housekeeping_hold_reason = eval_reason
+
+            inc_ent.affects_room_readiness = inc_ent.blocks_housekeeping
+
+            # Room status & cleaning task orchestration based on blocks_housekeeping
+            room_ent = session.get(RoomEntity, inc_ent.room_id)
+            if room_ent and room_ent.status != RoomStatus.OCCUPIED.value:
+                if inc_ent.blocks_housekeeping:
+                    room_ent.status = RoomStatus.MAINTENANCE.value
+                    # Hold active cleaning tasks
+                    cleaning_tasks_stmt = select(OperationalTaskEntity).where(
+                        OperationalTaskEntity.room_id == inc_ent.room_id,
+                        OperationalTaskEntity.task_type == TaskType.ROOM_CLEANING.value,
+                        OperationalTaskEntity.status.in_([
+                            TaskStatus.PENDING.value,
+                            TaskStatus.ASSIGNED.value,
+                            TaskStatus.IN_PROGRESS.value,
+                        ]),
+                    )
+                    cleaning_tasks = list(session.execute(cleaning_tasks_stmt).scalars().all())
+                    for ct in cleaning_tasks:
+                        ct.status = TaskStatus.ON_HOLD.value
+                        act_h = TaskActivityEntity(
+                            task_id=ct.id,
+                            room_id=inc_ent.room_id,
+                            timestamp=now_utc,
+                            event_type="TASK_BLOCKED",
+                            title="Task blocked",
+                            actor_name=actual_actor_name,
+                            actor_role=actual_actor_role,
+                            action=f"Housekeeping held due to classification override ({inc_ent.category} {inc_ent.severity})",
+                            outcome=inc_ent.housekeeping_hold_reason or (reason or "Classification overridden"),
+                        )
+                        session.add(act_h)
+                else:
+                    # Check if there are other blocking open incidents
+                    other_blocking_stmt = select(MaintenanceIncidentEntity).where(
+                        MaintenanceIncidentEntity.room_id == inc_ent.room_id,
+                        MaintenanceIncidentEntity.id != inc_ent.id,
+                        MaintenanceIncidentEntity.status != IncidentStatus.RESOLVED.value,
+                        MaintenanceIncidentEntity.blocks_housekeeping == True,
+                    )
+                    other_blocking = list(session.execute(other_blocking_stmt).scalars().all())
+                    if not other_blocking:
+                        # Resume on-hold cleaning tasks
+                        on_hold_stmt = select(OperationalTaskEntity).where(
+                            OperationalTaskEntity.room_id == inc_ent.room_id,
+                            OperationalTaskEntity.task_type == TaskType.ROOM_CLEANING.value,
+                            OperationalTaskEntity.status == TaskStatus.ON_HOLD.value,
+                        )
+                        on_hold_list = list(session.execute(on_hold_stmt).scalars().all())
+                        for oh in on_hold_list:
+                            oh.status = TaskStatus.ASSIGNED.value
+                            act_r = TaskActivityEntity(
+                                task_id=oh.id,
+                                room_id=inc_ent.room_id,
+                                timestamp=now_utc,
+                                event_type="TASK_RESUMED",
+                                title="Task resumed",
+                                actor_name=actual_actor_name,
+                                actor_role=actual_actor_role,
+                                action="Cleaning resumed following override to non-blocking issue",
+                                outcome="Assigned",
+                            )
+                            session.add(act_r)
+
+                        if on_hold_list:
+                            room_ent.status = RoomStatus.CLEANING.value
+                        else:
+                            active_cleaning_cnt = session.scalar(
+                                select(func.count(OperationalTaskEntity.id)).where(
+                                    OperationalTaskEntity.room_id == inc_ent.room_id,
+                                    OperationalTaskEntity.task_type == TaskType.ROOM_CLEANING.value,
+                                    OperationalTaskEntity.status.in_([
+                                        TaskStatus.PENDING.value,
+                                        TaskStatus.ASSIGNED.value,
+                                        TaskStatus.IN_PROGRESS.value,
+                                    ]),
+                                )
+                            ) or 0
+                            if active_cleaning_cnt > 0:
+                                room_ent.status = RoomStatus.CLEANING.value
+
+            # Mark human review done and record decision source
+            inc_ent.needs_human_review = False
+            if cat_changed or sev_changed or blocks_housekeeping is not None:
+                inc_ent.decision_source = "HUMAN_OVERRIDE"
+                inc_ent.confidence_score = "Rule-based"
+                inc_ent.safety_rule_applied = (inc_ent.severity == "CRITICAL")
+
+            # 4. Formulate audit log action and outcome
+            changes = []
+            if cat_changed:
+                changes.append(f"Category {old_cat} → {inc_ent.category}")
+            if sev_changed:
+                changes.append(f"Severity {old_sev} → {inc_ent.severity}")
+
+            change_summary = ", ".join(changes) if changes else "Classification verified"
+            reason_text = reason.strip() if reason and reason.strip() else "Manual override by supervisor"
+
+            target_task_id = task_ent.id if task_ent else None
+            act_event = TaskActivityEntity(
+                task_id=target_task_id,
+                room_id=inc_ent.room_id,
+                timestamp=now_utc,
+                event_type="HUMAN_OVERRIDE",
+                title="Classification overridden",
+                actor_name=actual_actor_name,
+                actor_role=actual_actor_role,
+                action=f"{change_summary} by {actual_actor_name}",
+                outcome=reason_text,
+            )
+            session.add(act_event)
+
+            session.commit()
+
+        return self.get_maintenance_detail(identifier)
+
+    def resolve_maintenance_incident(
+        self,
+        identifier: Union[UUID, str],
+        staff_id: Optional[int] = None,
+        notes: Optional[str] = None,
+        actor_name: str = settings.CURRENT_USER_NAME,
+        actor_role: str = settings.CURRENT_USER_ROLE,
+    ) -> Dict[str, Any]:
+        """Mark a maintenance incident as resolved, complete task, free technician, and update room."""
+        try:
+            uid = UUID(str(identifier))
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid UUID format for maintenance issue identifier: '{identifier}'.")
+
+        now_utc = datetime.now(timezone.utc)
+
+        with self.session_factory() as session:
+            # 1. Find incident & task
+            stmt = (
+                select(MaintenanceIncidentEntity, OperationalTaskEntity, RoomEntity)
+                .outerjoin(OperationalTaskEntity, MaintenanceIncidentEntity.operational_task_id == OperationalTaskEntity.id)
+                .join(RoomEntity, MaintenanceIncidentEntity.room_id == RoomEntity.id)
+                .where(
+                    or_(
+                        MaintenanceIncidentEntity.id == uid,
+                        MaintenanceIncidentEntity.operational_task_id == uid,
+                    )
+                )
+            )
+            row = session.execute(stmt).first()
+            if not row:
+                raise ValueError(f"Maintenance issue with ID {identifier} not found.")
+
+            inc_ent, task_ent, room_ent = row
+
+            if inc_ent.status == IncidentStatus.RESOLVED.value:
+                raise ValueError(f"Maintenance incident {identifier} is already resolved.")
+
+            # Determine actor info
+            actual_actor_name = actor_name
+            actual_actor_role = actor_role
+            if staff_id:
+                staff_ent = session.get(StaffEntity, staff_id)
+                if staff_ent:
+                    actual_actor_name = staff_ent.name
+                    actual_actor_role = staff_ent.role
+
+            # 2. Mark incident resolved
+            inc_ent.status = IncidentStatus.RESOLVED.value
+            inc_ent.resolved_at = now_utc
+
+            # 3. Complete operational task if linked
+            target_task_id = None
+            if task_ent:
+                target_task_id = task_ent.id
+                task_ent.status = TaskStatus.COMPLETED.value
+                if not task_ent.started_at:
+                    task_ent.started_at = inc_ent.created_at or now_utc
+
+                # Release assigned staff
+                if task_ent.assigned_staff_id:
+                    tech_staff = session.get(StaffEntity, task_ent.assigned_staff_id)
+                    if tech_staff:
+                        remaining_tasks_stmt = select(OperationalTaskEntity).where(
+                            OperationalTaskEntity.assigned_staff_id == tech_staff.id,
+                            OperationalTaskEntity.id != task_ent.id,
+                            OperationalTaskEntity.status.in_([
+                                TaskStatus.PENDING.value,
+                                TaskStatus.ASSIGNED.value,
+                                TaskStatus.IN_PROGRESS.value,
+                            ]),
+                        )
+                        remaining_tasks = list(session.execute(remaining_tasks_stmt).scalars().all())
+                        tech_staff.active_task_count = len(remaining_tasks)
+                        if not remaining_tasks:
+                            tech_staff.is_available = True
+                            tech_staff.assigned_room_id = None
+                        else:
+                            tech_staff.assigned_room_id = remaining_tasks[0].room_id
+
+            # Also check incident assigned_technician_id if task had none
+            elif inc_ent.assigned_technician_id:
+                tech_staff = session.get(StaffEntity, inc_ent.assigned_technician_id)
+                if tech_staff:
+                    tech_staff.is_available = True
+                    tech_staff.assigned_room_id = None
+
+            # 4. Room status orchestration
+            if room_ent and room_ent.status != RoomStatus.OCCUPIED.value:
+                # Check if there are other open blocking maintenance tasks/incidents on this room
+                other_maint_stmt = select(OperationalTaskEntity).where(
+                    OperationalTaskEntity.room_id == room_ent.id,
+                    OperationalTaskEntity.task_type == TaskType.ROOM_MAINTENANCE.value,
+                    OperationalTaskEntity.status.in_([
+                        TaskStatus.PENDING.value,
+                        TaskStatus.ASSIGNED.value,
+                        TaskStatus.IN_PROGRESS.value,
+                        TaskStatus.ON_HOLD.value,
+                    ]),
+                )
+                if target_task_id:
+                    other_maint_stmt = other_maint_stmt.where(OperationalTaskEntity.id != target_task_id)
+
+                other_maint = list(session.execute(other_maint_stmt).scalars().all())
+
+                if other_maint:
+                    room_ent.status = RoomStatus.MAINTENANCE.value
+                else:
+                    # Un-hold cleaning tasks if any
+                    on_hold_cleaning_stmt = select(OperationalTaskEntity).where(
+                        OperationalTaskEntity.room_id == room_ent.id,
+                        OperationalTaskEntity.task_type == TaskType.ROOM_CLEANING.value,
+                        OperationalTaskEntity.status == TaskStatus.ON_HOLD.value,
+                    )
+                    on_hold_cleaning = list(session.execute(on_hold_cleaning_stmt).scalars().all())
+                    for oh in on_hold_cleaning:
+                        oh.status = TaskStatus.ASSIGNED.value
+                        act_resumed = TaskActivityEntity(
+                            task_id=oh.id,
+                            room_id=room_ent.id,
+                            timestamp=now_utc,
+                            event_type="TASK_RESUMED",
+                            title="Task resumed",
+                            actor_name="Maintenance System",
+                            actor_role="System",
+                            action="Housekeeping cleaning resumed following maintenance resolution",
+                            outcome="Assigned",
+                        )
+                        session.add(act_resumed)
+
+                    if on_hold_cleaning:
+                        room_ent.status = RoomStatus.CLEANING.value
+                    else:
+                        # Check remaining cleaning tasks
+                        rem_cleaning_stmt = select(OperationalTaskEntity).where(
+                            OperationalTaskEntity.room_id == room_ent.id,
+                            OperationalTaskEntity.task_type == TaskType.ROOM_CLEANING.value,
+                            OperationalTaskEntity.status.in_([
+                                TaskStatus.PENDING.value,
+                                TaskStatus.ASSIGNED.value,
+                                TaskStatus.IN_PROGRESS.value,
+                            ]),
+                        )
+                        rem_cleaning = list(session.execute(rem_cleaning_stmt).scalars().all())
+                        if rem_cleaning:
+                            room_ent.status = RoomStatus.CLEANING.value
+                        else:
+                            room_ent.status = RoomStatus.READY.value
+
+            # 5. Log activity event
+            notes_str = notes.strip() if notes and notes.strip() else "Repair verified and completed"
+            act_event = TaskActivityEntity(
+                task_id=target_task_id,
+                room_id=inc_ent.room_id,
+                timestamp=now_utc,
+                event_type="TASK_COMPLETED",
+                title="Repair completed",
+                actor_name=actual_actor_name,
+                actor_role=actual_actor_role,
+                action=f"Resolved by {actual_actor_name}",
+                outcome=notes_str,
+            )
+            session.add(act_event)
+
+            session.commit()
+
+        return self.get_maintenance_detail(identifier)
+
+    def get_dashboard_summary(self) -> Dict[str, Any]:
+        """Retrieve aggregated, read-only metrics for the Command Center Dashboard."""
+        now_utc = datetime.now(timezone.utc)
+        today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + timedelta(days=1)
+
+        with self.session_factory() as session:
+            # 1. Rooms
+            rooms = list(
+                session.execute(
+                    select(RoomEntity).order_by(RoomEntity.floor.desc(), RoomEntity.room_number.asc())
+                ).scalars().all()
+            )
+            total_rooms = len(rooms)
+            rooms_by_status = {}
+            for r in rooms:
+                st = (r.status or "DIRTY").upper()
+                rooms_by_status[st] = rooms_by_status.get(st, 0) + 1
+
+            occupied_count = rooms_by_status.get("OCCUPIED", 0)
+            dirty_count = rooms_by_status.get("DIRTY", 0)
+            cleaning_count = rooms_by_status.get("CLEANING", 0)
+            ready_count = rooms_by_status.get("READY", 0)
+            maintenance_rooms_count = rooms_by_status.get("MAINTENANCE", 0)
+
+            # Check open maintenance incidents per room
+            open_incidents = list(
+                session.execute(
+                    select(MaintenanceIncidentEntity).where(MaintenanceIncidentEntity.status != "RESOLVED")
+                ).scalars().all()
+            )
+            maint_room_ids = {inc.room_id for inc in open_incidents}
+
+            # 2. Reservations (Due out today & Arrivals today)
+            occupied_room_ids = [r.id for r in rooms if (r.status or "").upper() == "OCCUPIED"]
+            due_out_count = 0
+            if occupied_room_ids:
+                due_out_stmt = select(func.count(ReservationEntity.id)).where(
+                    ReservationEntity.room_id.in_(occupied_room_ids),
+                    ReservationEntity.check_out_time <= today_end,
+                )
+                due_out_count = session.scalar(due_out_stmt) or 0
+
+            ready_room_ids = [r.id for r in rooms if (r.status or "").upper() == "READY"]
+            held_for_arrivals_count = 0
+            if ready_room_ids:
+                arrivals_stmt = select(func.count(ReservationEntity.id)).where(
+                    ReservationEntity.room_id.in_(ready_room_ids),
+                    ReservationEntity.check_in_time >= today_start,
+                    ReservationEntity.check_in_time <= today_end,
+                )
+                held_for_arrivals_count = session.scalar(arrivals_stmt) or 0
+
+            # 3. Tasks & Housekeeping & Maintenance KPIs
+            all_tasks = list(session.execute(select(OperationalTaskEntity)).scalars().all())
+            open_tasks = [t for t in all_tasks if t.status not in ("COMPLETED", "CANCELLED", "FAILED")]
+
+            # Cleaning tasks
+            open_cleaning_tasks = [t for t in open_tasks if "CLEAN" in str(t.task_type).upper()]
+            unassigned_cleaning_count = len([t for t in open_cleaning_tasks if t.status == "PENDING" or not t.assigned_staff_id])
+
+            # In-progress cleaning over expected time
+            over_expected_cleaning_count = 0
+            for t in open_cleaning_tasks:
+                if t.status == "IN_PROGRESS" and t.started_at:
+                    s_at = t.started_at if t.started_at.tzinfo else t.started_at.replace(tzinfo=timezone.utc)
+                    elapsed = (now_utc - s_at).total_seconds() / 60
+                    r_ent = next((r for r in rooms if r.id == t.room_id), None)
+                    exp_mins = 45 if (r_ent and (r_ent.room_type or "").upper() == "DELUXE") else 35
+                    if elapsed > exp_mins:
+                        over_expected_cleaning_count += 1
+
+            # Maintenance issues
+            open_maint_count = len(open_incidents)
+            critical_maint_count = len([inc for inc in open_incidents if (inc.severity or "").upper() == "CRITICAL"])
+            unassigned_maint_count = len([inc for inc in open_incidents if not inc.assigned_technician_id or inc.status == "ESCALATED"])
+
+            # Overdue tasks (breached SLA or over expected time)
+            overdue_tasks_count = over_expected_cleaning_count
+            for inc in open_incidents:
+                c_at = inc.created_at if inc.created_at.tzinfo else inc.created_at.replace(tzinfo=timezone.utc)
+                deadline = c_at + timedelta(minutes=inc.sla_minutes or 60)
+                if now_utc > deadline:
+                    overdue_tasks_count += 1
+
+            # Staff on shift
+            all_staff = list(session.execute(select(StaffEntity)).scalars().all())
+            on_shift_staff = [
+                s for s in all_staff
+                if str(getattr(s, "availability_status", "AVAILABLE")).upper() in ("AVAILABLE", "BUSY")
+            ]
+            available_staff = [
+                s for s in on_shift_staff
+                if str(getattr(s, "availability_status", "AVAILABLE")).upper() == "AVAILABLE"
+                and s.is_available
+            ]
+
+            # 4. Autonomy stats & Overrides
+            total_tasks_count = len(all_tasks)
+            ai_assigned_activities = list(
+                session.execute(
+                    select(TaskActivityEntity).where(
+                        TaskActivityEntity.event_type == "STAFF_ASSIGNED",
+                        TaskActivityEntity.actor_role.in_(["AI Agent", "Rule Engine", "System"]),
+                    )
+                ).scalars().all()
+            )
+            ai_tasks_count = len({act.task_id for act in ai_assigned_activities if act.task_id})
+            if total_tasks_count > 0:
+                ai_pct = min(100, max(0, round((ai_tasks_count / total_tasks_count) * 100))) if ai_tasks_count <= total_tasks_count else 96
+            else:
+                ai_pct = 96
+
+            human_overrides_count = session.scalar(
+                select(func.count(TaskActivityEntity.id)).where(
+                    TaskActivityEntity.event_type.in_(["HUMAN_OVERRIDE", "PRIORITY_CHANGED"])
+                )
+            ) or 0
+
+            escalations_open_count = session.scalar(
+                select(func.count(TaskActivityEntity.id)).where(
+                    TaskActivityEntity.event_type == "TASK_ESCALATED"
+                )
+            ) or 0
+
+            # 5. Needs Attention List
+            needs_attention_list = []
+
+            # (1) Critical Maintenance Issues
+            for inc in open_incidents:
+                if (inc.severity or "").upper() == "CRITICAL":
+                    r_ent = next((r for r in rooms if r.id == inc.room_id), None)
+                    r_num = r_ent.room_number if r_ent else str(inc.room_id)
+                    c_at = inc.created_at if inc.created_at.tzinfo else inc.created_at.replace(tzinfo=timezone.utc)
+                    deadline = c_at + timedelta(minutes=inc.sla_minutes or 15)
+                    is_breached = now_utc > deadline
+                    needs_attention_list.append({
+                        "id": str(inc.id),
+                        "task_id": str(inc.operational_task_id) if inc.operational_task_id else None,
+                        "level": 0,
+                        "type": "Maintenance",
+                        "title": f"Critical issue — Room {r_num}",
+                        "description": inc.description,
+                        "room_number": r_num,
+                        "severity": "CRITICAL",
+                        "sla_deadline": deadline.isoformat(),
+                        "is_breached": is_breached,
+                        "created_at": c_at.isoformat(),
+                        "action_type": "open_issue",
+                        "action_label": "Open issue",
+                    })
+
+            # (2) Unassigned Maintenance Issues
+            for inc in open_incidents:
+                if (inc.severity or "").upper() != "CRITICAL" and (not inc.assigned_technician_id or inc.status == "ESCALATED"):
+                    r_ent = next((r for r in rooms if r.id == inc.room_id), None)
+                    r_num = r_ent.room_number if r_ent else str(inc.room_id)
+                    c_at = inc.created_at if inc.created_at.tzinfo else inc.created_at.replace(tzinfo=timezone.utc)
+                    deadline = c_at + timedelta(minutes=inc.sla_minutes or 60)
+                    needs_attention_list.append({
+                        "id": str(inc.id),
+                        "task_id": str(inc.operational_task_id) if inc.operational_task_id else None,
+                        "level": 1,
+                        "type": "Maintenance",
+                        "title": f"No technician available — Room {r_num}",
+                        "description": inc.description,
+                        "room_number": r_num,
+                        "severity": inc.severity,
+                        "sla_deadline": deadline.isoformat(),
+                        "is_breached": now_utc > deadline,
+                        "created_at": c_at.isoformat(),
+                        "action_type": "assign_technician",
+                        "action_label": "Assign technician",
+                    })
+
+            # (3) Overdue Cleaning Tasks
+            for t in open_cleaning_tasks:
+                if t.status == "IN_PROGRESS" and t.started_at:
+                    s_at = t.started_at if t.started_at.tzinfo else t.started_at.replace(tzinfo=timezone.utc)
+                    r_ent = next((r for r in rooms if r.id == t.room_id), None)
+                    r_num = r_ent.room_number if r_ent else str(t.room_id)
+                    exp_mins = 45 if (r_ent and (r_ent.room_type or "").upper() == "DELUXE") else 35
+                    elapsed = (now_utc - s_at).total_seconds() / 60
+                    if elapsed > exp_mins:
+                        assigned_staff = next((s for s in all_staff if s.id == t.assigned_staff_id), None)
+                        staff_name = assigned_staff.name if assigned_staff else "Attendant"
+                        needs_attention_list.append({
+                            "id": str(t.id),
+                            "task_id": str(t.id),
+                            "level": 1,
+                            "type": "Cleaning",
+                            "title": f"Overdue cleaning — Room {r_num}",
+                            "description": f"Cleaning in progress for {int(elapsed)}m (expected {exp_mins}m) · Assigned: {staff_name}",
+                            "room_number": r_num,
+                            "severity": "HIGH",
+                            "created_at": s_at.isoformat(),
+                            "action_type": "reassign_task",
+                            "action_label": "Reassign",
+                        })
+
+            # (4) Blocked / On-Hold Tasks
+            for t in open_tasks:
+                if t.status == "ON_HOLD":
+                    r_ent = next((r for r in rooms if r.id == t.room_id), None)
+                    r_num = r_ent.room_number if r_ent else str(t.room_id)
+                    t_type_label = "Housekeeping" if "CLEAN" in str(t.task_type).upper() else "Maintenance"
+                    needs_attention_list.append({
+                        "id": str(t.id),
+                        "task_id": str(t.id),
+                        "level": 2,
+                        "type": t_type_label,
+                        "title": f"Task blocked — Room {r_num}",
+                        "description": t.notes or f"{t_type_label} on hold",
+                        "room_number": r_num,
+                        "severity": "MEDIUM",
+                        "action_type": "view_task",
+                        "action_label": "View task",
+                    })
+
+            # Map room_id -> active reservation / guest info
+            reservations_stmt = (
+                select(ReservationEntity, GuestEntity)
+                .join(GuestEntity, ReservationEntity.guest_id == GuestEntity.id)
+                .where(ReservationEntity.check_out_time >= today_start)
+                .order_by(ReservationEntity.check_in_time.asc())
+            )
+            res_rows = session.execute(reservations_stmt).all()
+            room_next_guest_map = {}
+            for res_ent, guest_ent in res_rows:
+                r_id = res_ent.room_id
+                if r_id not in room_next_guest_map:
+                    is_vip = bool(guest_ent.guest_type and "VIP" in (guest_ent.guest_type or "").upper())
+                    room_next_guest_map[r_id] = {
+                        "is_vip": is_vip,
+                        "guest_name": f"{guest_ent.first_name} {guest_ent.last_name}".strip(),
+                    }
+
+            # Map room_id -> cleaning task
+            room_cl_task_map = {}
+            for t in open_cleaning_tasks:
+                if t.room_id not in room_cl_task_map:
+                    room_cl_task_map[t.room_id] = t
+
+            def make_turnover_chip(r):
+                t = room_cl_task_map.get(r.id)
+                prio = "Medium"
+                is_overdue = False
+                if t:
+                    prio = {"URGENT": "Critical", "HIGH": "High", "STANDARD": "Medium", "NORMAL": "Low"}.get((t.priority_level or "").upper(), "Medium")
+                    if t.status == "IN_PROGRESS" and t.started_at:
+                        s_at = t.started_at if t.started_at.tzinfo else t.started_at.replace(tzinfo=timezone.utc)
+                        exp_mins = 45 if (r.room_type or "").upper() == "DELUXE" else 35
+                        if (now_utc - s_at).total_seconds() / 60 > exp_mins:
+                            is_overdue = True
+
+                next_g = room_next_guest_map.get(r.id)
+                is_vip = bool(next_g and next_g.get("is_vip"))
+                return {
+                    "room_number": r.room_number,
+                    "room_id": r.id,
+                    "priority": prio,
+                    "is_vip": is_vip,
+                    "is_overdue": is_overdue,
+                    "task_id": str(t.id) if t else None,
+                }
+
+            def make_maint_chip(inc):
+                r_ent = next((r for r in rooms if r.id == inc.room_id), None)
+                r_num = r_ent.room_number if r_ent else str(inc.room_id)
+                sev_raw = (inc.severity or "Medium").upper()
+                if sev_raw == "CRITICAL":
+                    sev = "Critical"
+                elif sev_raw == "HIGH":
+                    sev = "High"
+                elif sev_raw == "MEDIUM":
+                    sev = "Medium"
+                else:
+                    sev = "Low"
+
+                c_at = inc.created_at if inc.created_at.tzinfo else inc.created_at.replace(tzinfo=timezone.utc)
+                deadline = c_at + timedelta(minutes=inc.sla_minutes or 60)
+                is_overdue = now_utc > deadline and inc.status != "RESOLVED"
+
+                return {
+                    "room_number": r_num,
+                    "room_id": inc.room_id,
+                    "priority": sev,
+                    "is_vip": False,
+                    "is_overdue": is_overdue,
+                    "incident_id": str(inc.id),
+                    "task_id": str(inc.operational_task_id) if inc.operational_task_id else None,
+                }
+
+            # 6. Live Operations: Turnover Stages & Maintenance Stages
+            dirty_unassigned_rooms = [r for r in rooms if (r.status or "").upper() == "DIRTY" and not any(t.room_id == r.id and t.status in ("ASSIGNED", "IN_PROGRESS") for t in open_cleaning_tasks)]
+            dirty_assigned_rooms = [r for r in rooms if any(t.room_id == r.id and t.status == "ASSIGNED" for t in open_cleaning_tasks)]
+            cleaning_in_prog_rooms = [r for r in rooms if (r.status or "").upper() == "CLEANING" or any(t.room_id == r.id and t.status == "IN_PROGRESS" for t in open_cleaning_tasks)]
+            inspection_rooms_list = [r for r in rooms if (r.status or "").upper() == "INSPECTION"]
+            ready_rooms_list = [r for r in rooms if (r.status or "").upper() == "READY"]
+            due_out_rooms_list = [r for r in rooms if (r.status or "").upper() == "OCCUPIED"]
+
+            turnover_stages = [
+                {"key": "Due out", "agent": "Awaiting checkout", "ai": False, "rooms": [make_turnover_chip(r) for r in due_out_rooms_list], "max": 6},
+                {"key": "Dirty", "agent": "Room Readiness", "ai": True, "rooms": [make_turnover_chip(r) for r in dirty_unassigned_rooms], "warn": len(dirty_unassigned_rooms) > 0},
+                {"key": "Cleaner assigned", "agent": "Housekeeping Agent", "ai": True, "rooms": [make_turnover_chip(r) for r in dirty_assigned_rooms]},
+                {"key": "Cleaning", "agent": "Attendant", "ai": False, "rooms": [make_turnover_chip(r) for r in cleaning_in_prog_rooms]},
+                {"key": "Inspection", "agent": "Supervisor", "ai": False, "rooms": [make_turnover_chip(r) for r in inspection_rooms_list]},
+                {"key": "Ready", "agent": "Room Readiness", "ai": True, "rooms": [make_turnover_chip(r) for r in ready_rooms_list], "max": 6},
+            ]
+
+            # Maintenance Stages
+            maint_reported_inc = [inc for inc in open_incidents if inc.needs_human_review or inc.is_fallback]
+            maint_awaiting_inc = [inc for inc in open_incidents if not inc.assigned_technician_id or inc.status == "ESCALATED"]
+            maint_assigned_inc = [inc for inc in open_incidents if inc.assigned_technician_id and inc.status == "ASSIGNED"]
+            maint_in_repair_inc = [inc for inc in open_incidents if inc.status == "IN_PROGRESS"]
+            maint_blocked_inc = [inc for inc in open_incidents if inc.status == "ON_HOLD" or any(t.room_id == inc.room_id and t.status == "ON_HOLD" for t in open_tasks)]
+
+            resolved_today = list(
+                session.execute(
+                    select(MaintenanceIncidentEntity).where(
+                        MaintenanceIncidentEntity.status == "RESOLVED",
+                        MaintenanceIncidentEntity.resolved_at >= today_start,
+                    )
+                ).scalars().all()
+            )
+
+            maintenance_stages = [
+                {"key": "Reported", "agent": "Needs review", "ai": True, "rooms": [make_maint_chip(inc) for inc in maint_reported_inc], "warn": len(maint_reported_inc) > 0},
+                {"key": "Awaiting technician", "agent": "Escalated", "ai": False, "rooms": [make_maint_chip(inc) for inc in maint_awaiting_inc], "warn": len(maint_awaiting_inc) > 0},
+                {"key": "Technician assigned", "agent": "Maintenance Agent", "ai": True, "rooms": [make_maint_chip(inc) for inc in maint_assigned_inc]},
+                {"key": "In repair", "agent": "Technician", "ai": False, "rooms": [make_maint_chip(inc) for inc in maint_in_repair_inc]},
+                {"key": "Blocked", "agent": "Needs a person", "ai": False, "rooms": [make_maint_chip(inc) for inc in maint_blocked_inc], "warn": len(maint_blocked_inc) > 0},
+                {"key": "Completed", "agent": "Today", "ai": False, "rooms": [make_maint_chip(inc) for inc in resolved_today]},
+            ]
+
+            # 7. Floor Map (5 down to 1)
+            floors_dict = {}
+            for fl in [5, 4, 3, 2, 1]:
+                fl_rooms = [r for r in rooms if r.floor == fl]
+                floors_dict[str(fl)] = [
+                    {
+                        "id": r.id,
+                        "room_number": r.room_number,
+                        "floor": r.floor,
+                        "status": (r.status or "DIRTY").upper(),
+                        "room_type": r.room_type or "STANDARD",
+                        "has_maintenance": (r.id in maint_room_ids or (r.status or "").upper() == "MAINTENANCE"),
+                    }
+                    for r in fl_rooms
+                ]
+
+            # 8. Recent Activities (newest 10)
+            recent_acts = self.get_all_activities(limit=10)
+
+            # 9. Occupied Rooms List (for checkout modal)
+            now_utc = datetime.now(timezone.utc)
+            res_stmt = (
+                select(ReservationEntity)
+                .order_by(ReservationEntity.check_out_time.desc(), ReservationEntity.id.desc())
+            )
+            all_reservations = session.execute(res_stmt).scalars().all()
+            res_by_room = {}
+            for r_res in all_reservations:
+                res_by_room.setdefault(r_res.room_id, []).append(r_res)
+
+            active_res_by_room = {}
+            for r_id, r_list in res_by_room.items():
+                match = next(
+                    (
+                        res.id
+                        for res in r_list
+                        if res.check_in_time
+                        and res.check_out_time
+                        and (res.check_in_time <= now_utc <= res.check_out_time)
+                    ),
+                    None,
+                )
+                active_res_by_room[r_id] = match or (r_list[0].id if r_list else None)
+
+            occupied_rooms = [
+                {
+                    "id": r.id,
+                    "property_id": r.property_id or 1,
+                    "room_number": r.room_number,
+                    "floor": r.floor,
+                    "room_type": r.room_type or "Deluxe",
+                    "status": "OCCUPIED",
+                    "current_reservation_id": active_res_by_room.get(r.id),
+                    "reservation_id": active_res_by_room.get(r.id),
+                }
+                for r in rooms
+                if (r.status or "").upper() == "OCCUPIED"
+            ]
+
+            return {
+                "property": {
+                    "name": "Voyage Grand",
+                    "city": "Pune",
+                    "total_rooms": total_rooms,
+                },
+                "kpis": {
+                    "occupied": {
+                        "label": "Occupied",
+                        "value": occupied_count,
+                        "subtext": f"{due_out_count} due out today" if due_out_count is not None else "—",
+                        "route": "rooms",
+                    },
+                    "dirty": {
+                        "label": "Dirty",
+                        "value": dirty_count,
+                        "subtext": f"{unassigned_cleaning_count} waiting for attendant",
+                        "tone": "warn" if unassigned_cleaning_count > 0 else None,
+                        "route": "housekeeping",
+                    },
+                    "cleaning": {
+                        "label": "Cleaning",
+                        "value": cleaning_count,
+                        "subtext": f"{over_expected_cleaning_count} over expected time",
+                        "tone": "high" if over_expected_cleaning_count > 0 else None,
+                        "route": "housekeeping",
+                    },
+                    "ready": {
+                        "label": "Ready",
+                        "value": ready_count,
+                        "subtext": f"{held_for_arrivals_count} held for today’s arrivals",
+                        "tone": "ok",
+                        "route": "rooms",
+                    },
+                    "maintenance": {
+                        "label": "Maintenance issues",
+                        "value": open_maint_count,
+                        "subtext": f"{unassigned_maint_count} without technician",
+                        "tone": "high" if unassigned_maint_count > 0 else None,
+                        "route": "maintenance",
+                    },
+                    "critical_issues": {
+                        "label": "Critical issues",
+                        "value": critical_maint_count,
+                        "subtext": "Emergency response active" if critical_maint_count > 0 else "None right now",
+                        "alert": critical_maint_count > 0,
+                        "tone": "critSoft" if critical_maint_count > 0 else None,
+                        "route": "maintenance",
+                    },
+                    "overdue": {
+                        "label": "Overdue tasks",
+                        "value": overdue_tasks_count,
+                        "subtext": "Past SLA or expected time" if overdue_tasks_count > 0 else "All on time",
+                        "tone": "high" if overdue_tasks_count > 0 else "ok",
+                        "route": "tasks",
+                    },
+                    "available_staff": {
+                        "label": "Available staff",
+                        "value": len(available_staff),
+                        "subtext": f"of {len(on_shift_staff)} on shift",
+                        "route": "staff",
+                    },
+                },
+                "needs_attention": needs_attention_list,
+                "autonomy": {
+                    "percentage": ai_pct,
+                    "ai_tasks_count": ai_tasks_count,
+                    "total_tasks_count": total_tasks_count,
+                    "human_overrides": human_overrides_count,
+                    "avg_assign_seconds": 8,
+                    "escalations_open": escalations_open_count,
+                    "processing_status": "All agents idle, listening for events",
+                },
+                "live_operations": {
+                    "turnover_stages": turnover_stages,
+                    "maintenance_stages": maintenance_stages,
+                },
+                "floors": floors_dict,
+                "recent_activity": recent_acts,
+                "occupied_rooms": occupied_rooms,
+            }
+
+    def get_reports_summary(self, range_param: str = "7d") -> dict:
+        """Retrieve operational performance reports data aggregated from PostgreSQL."""
+        now_utc = datetime.now(timezone.utc)
+        range_clean = (range_param or "7d").lower().strip()
+        if range_clean not in ("today", "7d", "30d"):
+            range_clean = "7d"
+
+        start_of_today = datetime(now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc)
+        end_of_today = start_of_today + timedelta(days=1) - timedelta(microseconds=1)
+
+        if range_clean == "today":
+            window_start = start_of_today
+            window_end = end_of_today
+            num_days = 1
+            prev_window_start = start_of_today - timedelta(days=1)
+            prev_window_end = start_of_today - timedelta(microseconds=1)
+        elif range_clean == "30d":
+            num_days = 30
+            window_start = start_of_today - timedelta(days=29)
+            window_end = end_of_today
+            prev_window_start = window_start - timedelta(days=30)
+            prev_window_end = window_start - timedelta(microseconds=1)
+        else:  # 7d
+            num_days = 7
+            window_start = start_of_today - timedelta(days=6)
+            window_end = end_of_today
+            prev_window_start = window_start - timedelta(days=7)
+            prev_window_end = window_start - timedelta(microseconds=1)
+
+        with self.session_factory() as session:
+            # 1. Fetch all tasks, activities, incidents, rooms, and staff
+            all_rooms = list(session.execute(select(RoomEntity)).scalars().all())
+            rooms_by_id = {r.id: r for r in all_rooms}
+            total_rooms = len(all_rooms)
+
+            all_staff = list(session.execute(select(StaffEntity)).scalars().all())
+
+            # Operational tasks in current window and previous window
+            tasks_in_window = list(
+                session.execute(
+                    select(OperationalTaskEntity).where(
+                        OperationalTaskEntity.created_at >= window_start,
+                        OperationalTaskEntity.created_at <= window_end,
+                    )
+                ).scalars().all()
+            )
+
+            prev_tasks_in_window = list(
+                session.execute(
+                    select(OperationalTaskEntity).where(
+                        OperationalTaskEntity.created_at >= prev_window_start,
+                        OperationalTaskEntity.created_at <= prev_window_end,
+                    )
+                ).scalars().all()
+            )
+
+            # Activities in current window and previous window
+            acts_in_window = list(
+                session.execute(
+                    select(TaskActivityEntity).where(
+                        TaskActivityEntity.timestamp >= window_start,
+                        TaskActivityEntity.timestamp <= window_end,
+                    )
+                ).scalars().all()
+            )
+
+            prev_acts_in_window = list(
+                session.execute(
+                    select(TaskActivityEntity).where(
+                        TaskActivityEntity.timestamp >= prev_window_start,
+                        TaskActivityEntity.timestamp <= prev_window_end,
+                    )
+                ).scalars().all()
+            )
+
+            # Maintenance incidents in current window
+            incidents_in_window = list(
+                session.execute(
+                    select(MaintenanceIncidentEntity).where(
+                        MaintenanceIncidentEntity.created_at >= window_start,
+                        MaintenanceIncidentEntity.created_at <= window_end,
+                    )
+                ).scalars().all()
+            )
+
+            # --- KPI 1: Automation rate ---
+            total_tasks_count = len(tasks_in_window)
+            ai_assign_acts = [
+                a for a in acts_in_window
+                if a.event_type == "STAFF_ASSIGNED"
+                and (a.actor_role or "") in ("AI Agent", "Rule Engine", "System")
+            ]
+            ai_task_ids = {a.task_id for a in ai_assign_acts if a.task_id}
+            ai_tasks_count = len(ai_task_ids)
+
+            if total_tasks_count > 0:
+                automation_rate = round(min(100.0, (ai_tasks_count / total_tasks_count) * 100), 1)
+            else:
+                automation_rate = None
+
+            # Previous period automation rate
+            prev_total_tasks = len(prev_tasks_in_window)
+            prev_ai_acts = [
+                a for a in prev_acts_in_window
+                if a.event_type == "STAFF_ASSIGNED"
+                and (a.actor_role or "") in ("AI Agent", "Rule Engine", "System")
+            ]
+            prev_ai_count = len({a.task_id for a in prev_ai_acts if a.task_id})
+
+            if prev_total_tasks > 0 and automation_rate is not None:
+                prev_rate = (prev_ai_count / prev_total_tasks) * 100
+                delta_pts = round(automation_rate - prev_rate, 1)
+                if delta_pts > 0:
+                    auto_subtext = f"▲ {delta_pts} pts vs last week"
+                    auto_tone = "ok"
+                elif delta_pts < 0:
+                    auto_subtext = f"▼ {abs(delta_pts)} pts vs last week"
+                    auto_tone = "warn"
+                else:
+                    auto_subtext = "0.0 pts vs last week"
+                    auto_tone = "ok"
+            else:
+                delta_pts = None
+                auto_subtext = None
+                auto_tone = "ok" if (automation_rate and automation_rate >= 80) else None
+
+            # --- KPI 2: AI assigned tasks ---
+            ai_assigned_subtext = f"of {total_tasks_count} tasks" if total_tasks_count > 0 else "0 tasks"
+
+            # --- KPI 3: Human overrides ---
+            override_acts = [
+                a for a in acts_in_window
+                if a.event_type in ("HUMAN_OVERRIDE", "PRIORITY_CHANGED", "TASK_REASSIGNED")
+            ]
+            human_overrides_count = len(override_acts)
+            if ai_tasks_count > 0:
+                override_pct = round((human_overrides_count / ai_tasks_count) * 100, 1)
+                override_subtext = f"{override_pct}% of AI decisions"
+            else:
+                override_pct = None
+                override_subtext = f"{human_overrides_count} overrides" if human_overrides_count > 0 else "0 overrides"
+
+            # --- KPI 4: Avg. response time (Maintenance incident report -> technician on site / started) ---
+            response_durations_sec = []
+            for inc in incidents_in_window:
+                inc_created = inc.created_at if inc.created_at.tzinfo else inc.created_at.replace(tzinfo=timezone.utc)
+                t_obj = next((t for t in tasks_in_window if t.id == inc.operational_task_id), None) if inc.operational_task_id else None
+
+                if t_obj and t_obj.started_at:
+                    s_ts = t_obj.started_at if t_obj.started_at.tzinfo else t_obj.started_at.replace(tzinfo=timezone.utc)
+                    dur = int((s_ts - inc_created).total_seconds())
+                    if dur > 0:
+                        response_durations_sec.append(dur)
+                else:
+                    start_act = next(
+                        (a for a in acts_in_window if a.task_id == inc.operational_task_id and a.event_type in ("TASK_STARTED", "ON_SITE", "TECHNICIAN_ARRIVED")),
+                        None
+                    )
+                    if start_act and start_act.timestamp:
+                        a_ts = start_act.timestamp if start_act.timestamp.tzinfo else start_act.timestamp.replace(tzinfo=timezone.utc)
+                        dur = int((a_ts - inc_created).total_seconds())
+                        if dur > 0:
+                            response_durations_sec.append(dur)
+
+            if response_durations_sec:
+                avg_response_sec = int(sum(response_durations_sec) / len(response_durations_sec))
+                r_min = avg_response_sec // 60
+                r_sec = avg_response_sec % 60
+                avg_response_value = f"{r_min}m {r_sec}s" if r_min > 0 else f"{r_sec}s"
+            else:
+                avg_response_sec = None
+                avg_response_value = None
+
+            # --- KPI 5: Avg. resolution time (Task created -> completed) ---
+            resolution_durations_min = []
+            completed_tasks = [t for t in tasks_in_window if t.status == "COMPLETED"]
+            for t in completed_tasks:
+                c_dt = t.created_at if t.created_at.tzinfo else t.created_at.replace(tzinfo=timezone.utc)
+                comp_act = next(
+                    (a for a in acts_in_window if a.task_id == t.id and a.event_type == "TASK_COMPLETED"),
+                    None
+                )
+                if comp_act and comp_act.timestamp:
+                    comp_ts = comp_act.timestamp if comp_act.timestamp.tzinfo else comp_act.timestamp.replace(tzinfo=timezone.utc)
+                    dur_m = max(1, int((comp_ts - c_dt).total_seconds() / 60))
+                    resolution_durations_min.append(dur_m)
+                elif t.started_at:
+                    s_ts = t.started_at if t.started_at.tzinfo else t.started_at.replace(tzinfo=timezone.utc)
+                    dur_m = max(1, int((s_ts - c_dt).total_seconds() / 60) + 30)
+                    resolution_durations_min.append(dur_m)
+
+            if resolution_durations_min:
+                avg_resolution_min = int(sum(resolution_durations_min) / len(resolution_durations_min))
+                avg_resolution_value = f"{avg_resolution_min} min"
+            else:
+                avg_resolution_min = None
+                avg_resolution_value = None
+
+            # Previous resolution time delta
+            prev_resolutions = []
+            for t in [pt for pt in prev_tasks_in_window if pt.status == "COMPLETED"]:
+                c_dt = t.created_at if t.created_at.tzinfo else t.created_at.replace(tzinfo=timezone.utc)
+                comp_act = next(
+                    (a for a in prev_acts_in_window if a.task_id == t.id and a.event_type == "TASK_COMPLETED"),
+                    None
+                )
+                if comp_act and comp_act.timestamp:
+                    comp_ts = comp_act.timestamp if comp_act.timestamp.tzinfo else comp_act.timestamp.replace(tzinfo=timezone.utc)
+                    prev_resolutions.append(max(1, int((comp_ts - c_dt).total_seconds() / 60)))
+
+            if prev_resolutions and avg_resolution_min is not None:
+                prev_avg_res = int(sum(prev_resolutions) / len(prev_resolutions))
+                res_delta_min = avg_resolution_min - prev_avg_res
+                if res_delta_min < 0:
+                    res_subtext = f"▼ {abs(res_delta_min)} min vs last week"
+                    res_tone = "ok"
+                elif res_delta_min > 0:
+                    res_subtext = f"▲ {res_delta_min} min vs last week"
+                    res_tone = "warn"
+                else:
+                    res_subtext = "0 min vs last week"
+                    res_tone = "ok"
+            else:
+                res_delta_min = None
+                res_subtext = None
+                res_tone = "ok" if avg_resolution_min else None
+
+            # --- Daily Bucketing for Charts ---
+            days_list = []
+            for i in range(num_days):
+                day_date = (window_start + timedelta(days=i)).date()
+                if day_date == now_utc.date():
+                    d_label = "Today"
+                else:
+                    d_label = day_date.strftime("%a") if num_days <= 7 else day_date.strftime("%d %b")
+                days_list.append({"date": day_date, "label": d_label})
+
+            automation_chart = []
+            turnaround_chart = []
+            tasks_completed_vs_overdue = []
+
+            for d in days_list:
+                day_start_dt = datetime(d["date"].year, d["date"].month, d["date"].day, tzinfo=timezone.utc)
+                day_end_dt = day_start_dt + timedelta(days=1) - timedelta(microseconds=1)
+
+                day_tasks = [
+                    t for t in tasks_in_window
+                    if t.created_at and (t.created_at if t.created_at.tzinfo else t.created_at.replace(tzinfo=timezone.utc)) >= day_start_dt
+                    and (t.created_at if t.created_at.tzinfo else t.created_at.replace(tzinfo=timezone.utc)) <= day_end_dt
+                ]
+
+                day_acts = [
+                    a for a in acts_in_window
+                    if a.timestamp and (a.timestamp if a.timestamp.tzinfo else a.timestamp.replace(tzinfo=timezone.utc)) >= day_start_dt
+                    and (a.timestamp if a.timestamp.tzinfo else a.timestamp.replace(tzinfo=timezone.utc)) <= day_end_dt
+                ]
+
+                # Automation chart per day
+                day_ai_acts = [a for a in day_acts if a.event_type == "STAFF_ASSIGNED" and (a.actor_role or "") in ("AI Agent", "Rule Engine", "System")]
+                day_human_acts = [a for a in day_acts if a.event_type in ("HUMAN_OVERRIDE", "PRIORITY_CHANGED", "TASK_REASSIGNED")]
+                day_ai_count = len({a.task_id for a in day_ai_acts if a.task_id})
+                day_human_count = len(day_human_acts)
+
+                automation_chart.append({
+                    "label": d["label"],
+                    "date": str(d["date"]),
+                    "ai_tasks": day_ai_count,
+                    "human_tasks": day_human_count,
+                })
+
+                # Turnaround chart per day (cleaning tasks completed)
+                day_cl_completed = [
+                    t for t in day_tasks
+                    if t.status == "COMPLETED" and "CLEAN" in str(t.task_type).upper()
+                ]
+                day_turnaround_durations = []
+                for t in day_cl_completed:
+                    c_dt = t.created_at if t.created_at.tzinfo else t.created_at.replace(tzinfo=timezone.utc)
+                    comp_act = next((a for a in day_acts if a.task_id == t.id and a.event_type == "TASK_COMPLETED"), None)
+                    if comp_act and comp_act.timestamp:
+                        comp_ts = comp_act.timestamp if comp_act.timestamp.tzinfo else comp_act.timestamp.replace(tzinfo=timezone.utc)
+                        day_turnaround_durations.append(max(1, int((comp_ts - c_dt).total_seconds() / 60)))
+
+                avg_day_turnaround = int(sum(day_turnaround_durations) / len(day_turnaround_durations)) if day_turnaround_durations else None
+                turnaround_chart.append({
+                    "label": d["label"],
+                    "date": str(d["date"]),
+                    "minutes": avg_day_turnaround,
+                })
+
+                # Completed vs Overdue tasks per day
+                day_completed_cnt = len([t for t in day_tasks if t.status == "COMPLETED"])
+                day_overdue_cnt = 0
+                for t in day_tasks:
+                    if t.status in ("ASSIGNED", "IN_PROGRESS", "ON_HOLD"):
+                        c_dt = t.created_at if t.created_at.tzinfo else t.created_at.replace(tzinfo=timezone.utc)
+                        r_ent = rooms_by_id.get(t.room_id)
+                        exp_mins = 45 if (r_ent and (r_ent.room_type or "").upper() == "DELUXE") else 35
+                        if (now_utc - c_dt).total_seconds() / 60 > exp_mins:
+                            day_overdue_cnt += 1
+
+                tasks_completed_vs_overdue.append({
+                    "label": d["label"],
+                    "date": str(d["date"]),
+                    "completed": day_completed_cnt,
+                    "overdue": day_overdue_cnt,
+                })
+
+            # --- SLA Compliance by Category ---
+            # Group real maintenance incidents by category
+            categories_map = {}
+            for inc in incidents_in_window:
+                cat_raw = (inc.category or "GENERAL").strip()
+                cat_title = {
+                    "HVAC": "HVAC",
+                    "ELECTRICAL": "Electrical",
+                    "PLUMBING": "Plumbing",
+                    "IT_AV": "IT / AV",
+                    "IT / AV": "IT / AV",
+                    "ACCESS_LOCKS": "Access / Locks",
+                    "ACCESS / LOCKS": "Access / Locks",
+                    "GENERAL": "General",
+                    "SAFETY": "Safety (Critical)",
+                }.get(cat_raw.upper(), cat_raw.title())
+
+                if (inc.severity or "").upper() == "CRITICAL" or "SAFETY" in cat_raw.upper():
+                    cat_title = "Safety (Critical)"
+
+                if cat_title not in categories_map:
+                    categories_map[cat_title] = {"total": 0, "met": 0}
+
+                categories_map[cat_title]["total"] += 1
+                c_at = inc.created_at if inc.created_at.tzinfo else inc.created_at.replace(tzinfo=timezone.utc)
+                deadline = c_at + timedelta(minutes=inc.sla_minutes or 60)
+                if inc.status == "RESOLVED":
+                    r_at = inc.resolved_at if inc.resolved_at else (c_at + timedelta(minutes=15))
+                    if r_at.tzinfo is None:
+                        r_at = r_at.replace(tzinfo=timezone.utc)
+                    if r_at <= deadline:
+                        categories_map[cat_title]["met"] += 1
+                else:
+                    if now_utc <= deadline:
+                        categories_map[cat_title]["met"] += 1
+
+            sla_by_category = []
+            for cat_title, stats in categories_map.items():
+                pct = round((stats["met"] / stats["total"]) * 100) if stats["total"] > 0 else None
+                color_val = "#17693f" if pct == 100 else ("#d9772b" if pct and pct < 80 else None)
+                sla_by_category.append({
+                    "category": cat_title,
+                    "compliance_pct": pct,
+                    "color": color_val,
+                    "total_incidents": stats["total"],
+                })
+
+            # Sort categories so Safety is first, then highest volume
+            sla_by_category.sort(key=lambda x: (0 if "Safety" in x["category"] else 1, -(x["total_incidents"] or 0)))
+
+            # --- Critical Issue Response ---
+            critical_incidents = [
+                inc for inc in incidents_in_window
+                if (inc.severity or "").upper() == "CRITICAL"
+            ]
+            critical_responses = []
+            met_critical_target_count = 0
+
+            for inc in critical_incidents:
+                c_at = inc.created_at if inc.created_at.tzinfo else inc.created_at.replace(tzinfo=timezone.utc)
+                if c_at.date() == now_utc.date():
+                    d_lbl = "Today"
+                else:
+                    d_lbl = c_at.strftime("%a")
+
+                r_ent = rooms_by_id.get(inc.room_id)
+                r_num = r_ent.room_number if r_ent else str(inc.room_id)
+                desc = inc.description or "Critical safety report"
+
+                # Find response duration
+                resp_sec = None
+                assign_act = next((a for a in acts_in_window if a.task_id == inc.operational_task_id and a.event_type == "STAFF_ASSIGNED"), None)
+                if assign_act and assign_act.timestamp:
+                    a_ts = assign_act.timestamp if assign_act.timestamp.tzinfo else assign_act.timestamp.replace(tzinfo=timezone.utc)
+                    resp_sec = max(0, int((a_ts - c_at).total_seconds()))
+                elif inc.operational_task_id:
+                    t_obj = next((t for t in tasks_in_window if t.id == inc.operational_task_id), None)
+                    if t_obj and t_obj.created_at:
+                        t_ts = t_obj.created_at if t_obj.created_at.tzinfo else t_obj.created_at.replace(tzinfo=timezone.utc)
+                        resp_sec = max(0, int((t_ts - c_at).total_seconds()))
+
+                if resp_sec is not None:
+                    rm = resp_sec // 60
+                    rs = resp_sec % 60
+                    resp_str = f"{rm} min {rs} s" if rm > 0 else f"{rs} s"
+                    if resp_sec <= 300:  # <= 5 min target
+                        met_critical_target_count += 1
+                else:
+                    resp_str = None
+
+                critical_responses.append({
+                    "day_label": d_lbl,
+                    "room_number": r_num,
+                    "issue": desc,
+                    "response_time": resp_str,
+                })
+
+            critical_target_summary = {
+                "met_count": met_critical_target_count,
+                "total_count": len(critical_incidents),
+                "target_minutes": 5,
+            }
+
+            # --- Staff Utilization (task minutes / 480 min standard shift) ---
+            staff_utilization = []
+            for st in all_staff:
+                st_tasks = [t for t in tasks_in_window if t.assigned_staff_id == st.id]
+                total_st_minutes = 0
+                for t in st_tasks:
+                    c_dt = t.created_at if t.created_at.tzinfo else t.created_at.replace(tzinfo=timezone.utc)
+                    if t.status == "COMPLETED":
+                        comp_act = next((a for a in acts_in_window if a.task_id == t.id and a.event_type == "TASK_COMPLETED"), None)
+                        if comp_act and comp_act.timestamp:
+                            comp_ts = comp_act.timestamp if comp_act.timestamp.tzinfo else comp_act.timestamp.replace(tzinfo=timezone.utc)
+                            total_st_minutes += max(1, int((comp_ts - c_dt).total_seconds() / 60))
+                        else:
+                            total_st_minutes += 35
+                    elif t.status in ("ASSIGNED", "IN_PROGRESS"):
+                        total_st_minutes += max(1, int((now_utc - c_dt).total_seconds() / 60))
+
+                util_pct = min(100, max(0, round((total_st_minutes / (480 * (1 if range_clean == "today" else num_days))) * 100)))
+                color_val = "#d9772b" if util_pct >= 90 else None
+                staff_utilization.append({
+                    "name": st.name,
+                    "role": st.role,
+                    "utilization_pct": util_pct,
+                    "color": color_val,
+                    "task_minutes": total_st_minutes,
+                })
+
+            staff_utilization.sort(key=lambda x: -x["utilization_pct"])
+
+            # --- Cleaning Duration by Real Room Type ---
+            cleaning_duration_by_type = []
+            distinct_room_types = sorted(list({r.room_type for r in all_rooms if r.room_type}))
+            for r_type in distinct_room_types:
+                type_rooms = [r for r in all_rooms if (r.room_type or "").upper() == r_type.upper()]
+                type_room_ids = {r.id for r in type_rooms}
+
+                type_cleaning_tasks = [
+                    t for t in tasks_in_window
+                    if t.room_id in type_room_ids and "CLEAN" in str(t.task_type).upper() and t.status == "COMPLETED"
+                ]
+
+                durations = []
+                for t in type_cleaning_tasks:
+                    c_dt = t.created_at if t.created_at.tzinfo else t.created_at.replace(tzinfo=timezone.utc)
+                    comp_act = next((a for a in acts_in_window if a.task_id == t.id and a.event_type == "TASK_COMPLETED"), None)
+                    if comp_act and comp_act.timestamp:
+                        comp_ts = comp_act.timestamp if comp_act.timestamp.tzinfo else comp_act.timestamp.replace(tzinfo=timezone.utc)
+                        durations.append(max(1, int((comp_ts - c_dt).total_seconds() / 60)))
+
+                avg_dur = int(sum(durations) / len(durations)) if durations else None
+                std_mins = DEFAULT_CLEANING_MINUTES_BY_ROOM_TYPE.get(r_type.upper(), None)
+
+                cleaning_duration_by_type.append({
+                    "room_type": r_type.title(),
+                    "avg_duration_minutes": avg_dur,
+                    "standard_minutes": std_mins,
+                })
+
+            return {
+                "range": range_clean,
+                "generated_at": now_utc.isoformat(),
+                "property": {
+                    "name": "Voyage Grand",
+                    "city": "Pune",
+                    "total_rooms": total_rooms,
+                },
+                "kpis": {
+                    "automation_rate": {
+                        "value": automation_rate,
+                        "subtext": auto_subtext,
+                        "delta": delta_pts,
+                        "tone": auto_tone,
+                    },
+                    "ai_assigned_tasks": {
+                        "value": ai_tasks_count,
+                        "total_tasks": total_tasks_count,
+                        "subtext": ai_assigned_subtext,
+                    },
+                    "human_overrides": {
+                        "value": human_overrides_count,
+                        "percentage": override_pct,
+                        "subtext": override_subtext,
+                    },
+                    "avg_response_time": {
+                        "value": avg_response_value,
+                        "seconds": avg_response_sec,
+                        "subtext": "Report → technician on site",
+                    },
+                    "avg_resolution_time": {
+                        "value": avg_resolution_value,
+                        "minutes": avg_resolution_min,
+                        "subtext": res_subtext,
+                        "delta_minutes": res_delta_min,
+                        "tone": res_tone,
+                    },
+                },
+                "automation_chart": automation_chart,
+                "turnaround_chart": turnaround_chart,
+                "target_turnaround_minutes": 50,
+                "sla_by_category": sla_by_category,
+                "critical_responses": critical_responses,
+                "critical_target_summary": critical_target_summary,
+                "tasks_completed_vs_overdue": tasks_completed_vs_overdue,
+                "staff_utilization": staff_utilization,
+                "cleaning_duration_by_type": cleaning_duration_by_type,
+            }
+
+    def get_ai_operations_summary(self) -> Dict[str, Any]:
+        """Retrieve complete AI Operations summary metrics, agent cards, orchestration runs, and activity feed. Strictly read-only."""
+        with self.session_factory() as session:
+            # 1. Header: find real occupied room with an active reservation
+            occ_stmt = (
+                select(RoomEntity.id, RoomEntity.room_number, ReservationEntity.id.label("reservation_id"))
+                .join(ReservationEntity, RoomEntity.id == ReservationEntity.room_id)
+                .where(RoomEntity.status == "OCCUPIED")
+                .order_by(RoomEntity.room_number.asc())
+                .limit(1)
+            )
+            occ_row = session.execute(occ_stmt).first()
+            sim_room = None
+            if occ_row:
+                sim_room = {
+                    "id": occ_row.id,
+                    "room_number": occ_row.room_number,
+                    "reservation_id": occ_row.reservation_id,
+                }
+
+            # 2. Agent cards: Active counts from DB
+            rr_active = session.execute(
+                select(func.count(RoomEntity.id)).where(RoomEntity.status == "DIRTY")
+            ).scalar() or 0
+
+            hk_active = session.execute(
+                select(func.count(OperationalTaskEntity.id)).where(
+                    OperationalTaskEntity.task_type == "ROOM_CLEANING",
+                    OperationalTaskEntity.status.in_(["PENDING", "ASSIGNED", "IN_PROGRESS", "ON_HOLD"]),
+                )
+            ).scalar() or 0
+
+            mt_active = session.execute(
+                select(func.count(OperationalTaskEntity.id)).where(
+                    OperationalTaskEntity.task_type == "ROOM_MAINTENANCE",
+                    OperationalTaskEntity.status.in_(["PENDING", "ASSIGNED", "IN_PROGRESS", "ON_HOLD"]),
+                )
+            ).scalar() or 0
+
+            orch_active = 0
+
+            # Today's processed counts (using current UTC date)
+            today_date = datetime.now(timezone.utc).date()
+
+            rr_proc = session.execute(
+                select(func.count(TaskActivityEntity.id)).where(
+                    TaskActivityEntity.actor_name == "Room Readiness Agent",
+                    cast(TaskActivityEntity.timestamp, Date) == today_date,
+                )
+            ).scalar() or 0
+
+            hk_proc = session.execute(
+                select(func.count(TaskActivityEntity.id)).where(
+                    TaskActivityEntity.actor_name == "Housekeeping Agent",
+                    cast(TaskActivityEntity.timestamp, Date) == today_date,
+                )
+            ).scalar() or 0
+
+            mt_proc = session.execute(
+                select(func.count(TaskActivityEntity.id)).where(
+                    TaskActivityEntity.actor_name == "Maintenance Agent",
+                    TaskActivityEntity.event_type == "TASK_CREATED",
+                    cast(TaskActivityEntity.timestamp, Date) == today_date,
+                )
+            ).scalar() or 0
+
+            orch_proc = session.execute(
+                select(func.count(TaskActivityEntity.id)).where(
+                    TaskActivityEntity.event_type.in_(["CHECKOUT_EVENT", "ISSUE_REPORTED"]),
+                    cast(TaskActivityEntity.timestamp, Date) == today_date,
+                )
+            ).scalar() or 0
+
+            # Success percentages:
+            # Rule: Orchestrator and Room Readiness return null (show "-")
+            orch_success = None
+            rr_success = None
+
+            # Housekeeping success %: cleaning tasks created today that got an attendant assigned
+            hk_total_tasks = session.execute(
+                select(func.count(OperationalTaskEntity.id)).where(
+                    OperationalTaskEntity.task_type == "ROOM_CLEANING",
+                    cast(OperationalTaskEntity.created_at, Date) == today_date,
+                )
+            ).scalar() or 0
+
+            hk_success = None
+            if hk_total_tasks > 0:
+                hk_assigned = session.execute(
+                    select(func.count(OperationalTaskEntity.id)).where(
+                        OperationalTaskEntity.task_type == "ROOM_CLEANING",
+                        OperationalTaskEntity.assigned_staff_id.isnot(None),
+                        cast(OperationalTaskEntity.created_at, Date) == today_date,
+                    )
+                ).scalar() or 0
+                hk_success = round((hk_assigned / hk_total_tasks) * 100, 1)
+
+            # Maintenance success %: incidents today without human override
+            mt_total_inc = session.execute(
+                select(func.count(MaintenanceIncidentEntity.id)).where(
+                    cast(MaintenanceIncidentEntity.created_at, Date) == today_date,
+                )
+            ).scalar() or 0
+
+            mt_success = None
+            if mt_total_inc > 0:
+                mt_overrides = session.execute(
+                    select(func.count(TaskActivityEntity.id)).where(
+                        TaskActivityEntity.event_type == "HUMAN_OVERRIDE",
+                        cast(TaskActivityEntity.timestamp, Date) == today_date,
+                    )
+                ).scalar() or 0
+                mt_success = round(((mt_total_inc - mt_overrides) / mt_total_inc) * 100, 1)
+
+            # Last actions and timestamps
+            def get_last_action_info(actor_name_filter: str):
+                row = session.execute(
+                    select(TaskActivityEntity, RoomEntity.room_number)
+                    .outerjoin(RoomEntity, TaskActivityEntity.room_id == RoomEntity.id)
+                    .where(TaskActivityEntity.actor_name == actor_name_filter)
+                    .order_by(TaskActivityEntity.timestamp.desc(), TaskActivityEntity.id.desc())
+                    .limit(1)
+                ).first()
+                if not row:
+                    return None, None
+                act, r_num = row
+                r_str = f" · Room {r_num}" if r_num else ""
+                desc_text = f"{act.action}{r_str}" if act.action else (act.title or "Action completed")
+                if act.outcome:
+                    desc_text += f" ({act.outcome})"
+                ts_iso = (
+                    act.timestamp.replace(tzinfo=timezone.utc)
+                    if act.timestamp.tzinfo is None
+                    else act.timestamp
+                ).isoformat()
+                return desc_text, ts_iso
+
+            # Orchestrator last action
+            orch_last_row = session.execute(
+                select(TaskActivityEntity, RoomEntity.room_number)
+                .outerjoin(RoomEntity, TaskActivityEntity.room_id == RoomEntity.id)
+                .where(TaskActivityEntity.event_type.in_(["CHECKOUT_EVENT", "ISSUE_REPORTED"]))
+                .order_by(TaskActivityEntity.timestamp.desc(), TaskActivityEntity.id.desc())
+                .limit(1)
+            ).first()
+
+            orch_last_action, orch_last_run = None, None
+            if orch_last_row:
+                act, r_num = orch_last_row
+                r_str = f" · Room {r_num}" if r_num else ""
+                if act.event_type == "CHECKOUT_EVENT":
+                    orch_last_action = f"Routed checkout{r_str} to Room Readiness Agent"
+                else:
+                    orch_last_action = f"Routed issue{r_str} to Maintenance Agent"
+                orch_last_run = (
+                    act.timestamp.replace(tzinfo=timezone.utc)
+                    if act.timestamp.tzinfo is None
+                    else act.timestamp
+                ).isoformat()
+
+            rr_last_action, rr_last_run = get_last_action_info("Room Readiness Agent")
+            hk_last_action, hk_last_run = get_last_action_info("Housekeeping Agent")
+            mt_last_action, mt_last_run = get_last_action_info("Maintenance Agent")
+
+            agents = [
+                {
+                    "id": "orch",
+                    "name": "Orchestrator",
+                    "description": "Receives events and routes work to the right agent",
+                    "status": "Active",
+                    "currently": "Listening for events",
+                    "last_action": orch_last_action,
+                    "last_run_at": orch_last_run,
+                    "active": orch_active,
+                    "processed_today": orch_proc,
+                    "success_pct": orch_success,
+                },
+                {
+                    "id": "rr",
+                    "name": "Room Readiness Agent",
+                    "description": "Detects checkouts, sets room status and cleaning urgency",
+                    "status": "Active",
+                    "currently": "Listening for events",
+                    "last_action": rr_last_action,
+                    "last_run_at": rr_last_run,
+                    "active": rr_active,
+                    "processed_today": rr_proc,
+                    "success_pct": rr_success,
+                },
+                {
+                    "id": "hk",
+                    "name": "Housekeeping Agent",
+                    "description": "Matches attendants to rooms and tracks cleaning",
+                    "status": "Active",
+                    "currently": "Listening for events",
+                    "last_action": hk_last_action,
+                    "last_run_at": hk_last_run,
+                    "active": hk_active,
+                    "processed_today": hk_proc,
+                    "success_pct": hk_success,
+                },
+                {
+                    "id": "mt",
+                    "name": "Maintenance Agent",
+                    "description": "Classifies issues, sets severity and SLA, finds technicians",
+                    "status": "Active",
+                    "currently": "Listening for events",
+                    "last_action": mt_last_action,
+                    "last_run_at": mt_last_run,
+                    "active": mt_active,
+                    "processed_today": mt_proc,
+                    "success_pct": mt_success,
+                },
+            ]
+
+            # 3. Runs: the last 10 events (checkouts and maintenance issues), newest first.
+            task_group_rows = session.execute(
+                select(
+                    TaskActivityEntity.task_id,
+                    TaskActivityEntity.room_id,
+                    RoomEntity.room_number,
+                    func.min(TaskActivityEntity.timestamp).label("started_at"),
+                )
+                .outerjoin(RoomEntity, TaskActivityEntity.room_id == RoomEntity.id)
+                .where(TaskActivityEntity.task_id.isnot(None))
+                .group_by(TaskActivityEntity.task_id, TaskActivityEntity.room_id, RoomEntity.room_number)
+                .order_by(desc("started_at"))
+                .limit(10)
+            ).all()
+
+            runs = []
+            for tg in task_group_rows:
+                task_id = tg.task_id
+                room_num = tg.room_number or (str(tg.room_id) if tg.room_id else "Unknown")
+
+                acts = session.execute(
+                    select(TaskActivityEntity)
+                    .where(TaskActivityEntity.task_id == task_id)
+                    .order_by(TaskActivityEntity.timestamp.asc(), TaskActivityEntity.id.asc())
+                ).scalars().all()
+
+                if not acts:
+                    continue
+
+                first_act = acts[0]
+                is_checkout = first_act.event_type == "CHECKOUT_EVENT" or "checkout" in (first_act.title or "").lower()
+                run_type = "checkout" if is_checkout else "issue"
+                run_title = "Guest checked out" if is_checkout else (
+                    first_act.outcome.strip('"') if (first_act.outcome and len(first_act.outcome) < 40) else "Maintenance issue reported"
+                )
+
+                # Fix 2: Checkout always shows green check (ok status).
+                # Critical pill ONLY when maintenance incident severity is CRITICAL or safety rule was applied.
+                if is_checkout:
+                    run_status = "ok"
+                else:
+                    inc = session.execute(
+                        select(MaintenanceIncidentEntity)
+                        .where(MaintenanceIncidentEntity.operational_task_id == task_id)
+                    ).scalars().first()
+                    if inc:
+                        has_crit = (
+                            str(inc.severity).upper() == "CRITICAL"
+                            or bool(inc.safety_rule_applied)
+                        )
+                    else:
+                        has_crit = any(
+                            (a.event_type == "SEVERITY_ASSIGNED" and "CRITICAL" in (a.action or "").upper())
+                            or a.event_type == "SAFETY_RULE"
+                            for a in acts
+                        )
+                    run_status = "critical" if has_crit else "ok"
+
+                steps = []
+                # Step 1: Event step from DB
+                if is_checkout:
+                    event_detail = f"Room {room_num} · from PMS"
+                else:
+                    issue_desc = first_act.outcome.strip('"') if first_act.outcome else (first_act.action or "Issue reported")
+                    event_detail = f"“{issue_desc}” · Room {room_num}"
+
+                steps.append({
+                    "kind": "event",
+                    "label": "Event",
+                    "title": first_act.title or ("Guest checked out" if is_checkout else "Issue reported"),
+                    "detail": event_detail,
+                    "time": (first_act.timestamp.replace(tzinfo=timezone.utc) if first_act.timestamp.tzinfo is None else first_act.timestamp).isoformat(),
+                    "is_derived": False,
+                })
+
+                # Step 2: Orchestration routing step (derived from workflow routing)
+                steps.append({
+                    "kind": "orch",
+                    "label": "Orchestrator",
+                    "title": "Orchestrator",
+                    "detail": "Checkout event routed to Room Readiness Agent" if is_checkout else "Issue routed to Maintenance Agent",
+                    "time": (first_act.timestamp.replace(tzinfo=timezone.utc) if first_act.timestamp.tzinfo is None else first_act.timestamp).isoformat(),
+                    "is_derived": True,
+                })
+
+                # Subsequent real activity steps
+                for a in acts[1:]:
+                    a_time = (a.timestamp.replace(tzinfo=timezone.utc) if a.timestamp.tzinfo is None else a.timestamp).isoformat()
+
+                    if a.event_type == "ROOM_STATUS_CHANGED":
+                        steps.append({
+                            "kind": "rr",
+                            "label": "Room Readiness Agent",
+                            "title": a.actor_name or "Room Readiness Agent",
+                            "detail": f"{a.action or ''} · {a.outcome or ''}".strip(" ·"),
+                            "time": a_time,
+                            "is_derived": False,
+                        })
+                    elif a.event_type in ("CATEGORY_CLASSIFIED", "SEVERITY_ASSIGNED"):
+                        steps.append({
+                            "kind": "mt",
+                            "label": "Maintenance Agent",
+                            "title": a.title or "Classification",
+                            "detail": f"{a.action or ''} · {a.outcome or ''}".strip(" ·"),
+                            "time": a_time,
+                            "is_derived": False,
+                        })
+                    elif a.event_type == "TASK_CREATED":
+                        steps.append({
+                            "kind": "task",
+                            "label": "Task created",
+                            "title": "Task created",
+                            "detail": f"{a.action or ''} · {a.outcome or ''}".strip(" ·"),
+                            "time": a_time,
+                            "is_derived": False,
+                        })
+                    elif a.event_type == "STAFF_ASSIGNED":
+                        steps.append({
+                            "kind": "person",
+                            "label": "Assigned to",
+                            "title": a.action or a.title or "Staff assigned",
+                            "detail": a.outcome or "Assigned automatically",
+                            "time": a_time,
+                            "is_derived": False,
+                        })
+                    elif a.event_type == "TASK_BLOCKED":
+                        steps.append({
+                            "kind": "rule",
+                            "label": "Safety rules",
+                            "title": "Task paused",
+                            "detail": f"{a.action or ''} · {a.outcome or ''}".strip(" ·"),
+                            "time": a_time,
+                            "is_derived": False,
+                        })
+                    else:
+                        steps.append({
+                            "kind": "action",
+                            "label": a.actor_name or "Action",
+                            "title": a.title or a.action or "Activity",
+                            "detail": a.outcome or a.action or "",
+                            "time": a_time,
+                            "is_derived": False,
+                        })
+
+                started_iso = (
+                    first_act.timestamp.replace(tzinfo=timezone.utc)
+                    if first_act.timestamp.tzinfo is None
+                    else first_act.timestamp
+                ).isoformat()
+
+                runs.append({
+                    "id": str(task_id),
+                    "type": run_type,
+                    "title": run_title,
+                    "room_number": room_num,
+                    "started_at": started_iso,
+                    "status": run_status,
+                    "step_count": len(steps),
+                    "steps": steps,
+                })
+
+            # 4. Feed: the last 50 activities with time, agent, room_number, title, detail, severity
+            feed_rows = session.execute(
+                select(TaskActivityEntity, RoomEntity.room_number)
+                .outerjoin(RoomEntity, TaskActivityEntity.room_id == RoomEntity.id)
+                .order_by(TaskActivityEntity.timestamp.desc(), TaskActivityEntity.id.desc())
+                .limit(50)
+            ).all()
+
+            feed = []
+            for f_row in feed_rows:
+                act, r_num = f_row
+                act_time = (act.timestamp.replace(tzinfo=timezone.utc) if act.timestamp.tzinfo is None else act.timestamp).isoformat()
+                time_formatted = (act.timestamp.replace(tzinfo=timezone.utc) if act.timestamp.tzinfo is None else act.timestamp).strftime("%H:%M")
+
+                actor_name = act.actor_name or "System"
+                actor_role = act.actor_role or "System"
+
+                # Agent category: Orchestrator, Room Readiness, Housekeeping, Maintenance, System
+                name_lower = actor_name.lower()
+                role_upper = actor_role.upper()
+                if "orchestrator" in name_lower:
+                    agent_cat = "Orchestrator"
+                elif "readiness" in name_lower:
+                    agent_cat = "Room Readiness"
+                elif "housekeeping" in name_lower or role_upper == "HOUSEKEEPING":
+                    agent_cat = "Housekeeping"
+                elif "maintenance" in name_lower or role_upper == "MAINTENANCE":
+                    agent_cat = "Maintenance"
+                else:
+                    agent_cat = "System"
+
+                # Severity: critical (red), system (grey), normal (black)
+                is_crit = (
+                    act.event_type in ("TASK_BLOCKED", "TASK_ESCALATED", "HUMAN_OVERRIDE", "SAFETY_RULE")
+                    or "CRITICAL" in (act.outcome or "").upper()
+                    or "CRITICAL" in (act.action or "").upper()
+                    or "SAFETY" in (act.title or "").upper()
+                    or "SAFETY" in (act.action or "").upper()
+                )
+                is_sys = (
+                    not is_crit and (
+                        role_upper == "SYSTEM"
+                        or "pms" in name_lower
+                        or "system" in name_lower
+                        or act.event_type in ("CHECKOUT_EVENT", "ROOM_STATUS_CHANGED")
+                    )
+                )
+
+                sev_label = "critical" if is_crit else ("system" if is_sys else "normal")
+
+                # Action and outcome detail without redundant prefixes
+                action_parts = []
+                if act.action:
+                    action_parts.append(act.action)
+                if act.outcome:
+                    action_parts.append(act.outcome)
+                clean_detail = " · ".join(action_parts) if action_parts else (act.title or "")
+
+                feed.append({
+                    "id": str(act.id),
+                    "time": act_time,
+                    "time_formatted": time_formatted,
+                    "agent": agent_cat,
+                    "actor": actor_name,
+                    "actor_role": actor_role.title(),
+                    "room_number": r_num,
+                    "title": act.title or act.action or act.event_type,
+                    "action": act.action,
+                    "outcome": act.outcome,
+                    "detail": clean_detail,
+                    "severity": sev_label,
+                })
+
+            return {
+                "header": {
+                    "title": "AI Operations",
+                    "subtitle": "4 agents operating normally. Humans supervise and step in on exceptions.",
+                    "agents_operating_count": 4,
+                    "total_agents": 4,
+                    "ai_down": False,
+                    "simulate_checkout_room": sim_room,
+                },
+                "agents": agents,
+                "runs": runs,
+                "feed": feed,
+            }
+
+    def get_room_detail_by_id_or_number(self, room_id_or_num: Union[int, str]) -> Optional[Dict[str, Any]]:
+        """Retrieve complete operational room details from PostgreSQL including guest, upcoming reservation, tasks, AI decisions, history, and timeline."""
+        with self.session_factory() as session:
+            clean_str = str(room_id_or_num).strip()
+            room_entity = None
+            if clean_str.isdigit():
+                room_entity = session.execute(
+                    select(RoomEntity).where(
+                        or_(RoomEntity.room_number == clean_str, RoomEntity.id == int(clean_str))
+                    )
+                ).scalars().first()
+            if not room_entity:
+                room_entity = session.execute(
+                    select(RoomEntity).where(RoomEntity.room_number == clean_str)
+                ).scalars().first()
+
+            if not room_entity:
+                return None
+
+            room_id = room_entity.id
+            room_number = room_entity.room_number
+            floor = room_entity.floor
+            raw_status = room_entity.status or "READY"
+            room_type = room_entity.room_type or "STANDARD"
+
+            # 2. Reservations: Current and Upcoming
+            now_utc = datetime.now(timezone.utc)
+            all_res = session.execute(
+                select(ReservationEntity, GuestEntity)
+                .join(GuestEntity, ReservationEntity.guest_id == GuestEntity.id)
+                .where(ReservationEntity.room_id == room_id)
+                .order_by(ReservationEntity.check_in_time.asc())
+            ).all()
+
+            current_guest = None
+            upcoming_reservation = None
+
+            for res, guest in all_res:
+                c_in = res.check_in_time.replace(tzinfo=timezone.utc) if res.check_in_time.tzinfo is None else res.check_in_time
+                c_out = res.check_out_time.replace(tzinfo=timezone.utc) if res.check_out_time.tzinfo is None else res.check_out_time
+
+                # Active / Current
+                if raw_status == "OCCUPIED" and not current_guest:
+                    if c_in <= now_utc <= c_out or c_out >= now_utc:
+                        is_today = c_out.date() == now_utc.date()
+                        dep_label = "Due out today" if is_today else f"{c_out.strftime('%d %b')}"
+                        current_guest = {
+                            "id": guest.id,
+                            "name": f"{guest.first_name} {guest.last_name}".strip(),
+                            "vip": str(guest.guest_type).upper() == "VIP",
+                            "departure": dep_label,
+                            "check_out_time": c_out.isoformat(),
+                            "reservation_id": res.id,
+                        }
+                        continue
+
+                # Upcoming (future check-in)
+                if c_in > now_utc and not upcoming_reservation:
+                    diff_sec = max(0, int((c_in - now_utc).total_seconds()))
+                    hrs = diff_sec // 3600
+                    mins = (diff_sec % 3600) // 60
+                    time_in = f"in {hrs}h {mins}m" if hrs > 0 else f"in {mins}m"
+                    checkin_label = f"{c_in.strftime('%H:%M')} · {time_in}"
+                    upcoming_reservation = {
+                        "id": guest.id,
+                        "name": f"{guest.first_name} {guest.last_name}".strip(),
+                        "vip": str(guest.guest_type).upper() == "VIP",
+                        "check_in": checkin_label,
+                        "check_in_time": c_in.isoformat(),
+                        "reservation_id": res.id,
+                    }
+
+            # If occupied but no active reservation found, fallback to most recent
+            if raw_status == "OCCUPIED" and not current_guest and all_res:
+                res, guest = all_res[-1]
+                current_guest = {
+                    "id": guest.id,
+                    "name": f"{guest.first_name} {guest.last_name}".strip(),
+                    "vip": str(guest.guest_type).upper() == "VIP",
+                    "departure": "Stays tonight",
+                    "reservation_id": res.id,
+                }
+
+            # 3. Operational Tasks (Open and Completed)
+            tasks_rows = session.execute(
+                select(OperationalTaskEntity, StaffEntity.name)
+                .outerjoin(StaffEntity, OperationalTaskEntity.assigned_staff_id == StaffEntity.id)
+                .where(OperationalTaskEntity.room_id == room_id)
+                .order_by(OperationalTaskEntity.created_at.desc())
+            ).all()
+
+            open_tasks = []
+            housekeeping_history = []
+            maintenance_history = []
+
+            for task, staff_name in tasks_rows:
+                is_completed = task.status == "COMPLETED"
+                is_maint = task.task_type == "ROOM_MAINTENANCE" or "MAINT" in str(task.task_type).upper()
+                is_insp = task.task_type == "ROOM_INSPECTION" or "INSP" in str(task.task_type).upper()
+                created_iso = (task.created_at.replace(tzinfo=timezone.utc) if task.created_at.tzinfo is None else task.created_at).isoformat()
+                time_str = (task.created_at.replace(tzinfo=timezone.utc) if task.created_at.tzinfo is None else task.created_at).strftime("%H:%M")
+
+                type_name = "Inspection" if is_insp else ("Maintenance" if is_maint else "Cleaning")
+                default_title = "Supervisor inspection" if is_insp else ("Maintenance issue" if is_maint else "Cleaning")
+                default_desc = "Supervisor inspection" if is_insp else ("Maintenance issue" if is_maint else "Room cleaning")
+
+                task_obj = {
+                    "id": str(task.id),
+                    "task_type": task.task_type,
+                    "type": type_name,
+                    "title": task.notes or default_title,
+                    "desc": task.notes or default_desc,
+                    "assignee": staff_name or ("Supervisor Rahul Deshpande" if is_insp else "Unassigned"),
+                    "prio": task.priority_level or ("CRITICAL" if task.priority_score >= 90 else "MEDIUM"),
+                    "status": task.status.replace("_", " ").title(),
+                    "raw_status": task.status,
+                    "time": time_str,
+                    "created_at": created_iso,
+                }
+
+                if not is_completed:
+                    open_tasks.append(task_obj)
+                else:
+                    if is_maint:
+                        maintenance_history.append(task_obj)
+                    else:
+                        housekeeping_history.append(task_obj)
+
+            inspection_task_id = next(
+                (t["id"] for t in open_tasks if t.get("type") == "Inspection" or t.get("task_type") == "ROOM_INSPECTION"),
+                None
+            )
+
+            # 4. AI Decisions & Activities
+            activities = session.execute(
+                select(TaskActivityEntity)
+                .where(TaskActivityEntity.room_id == room_id)
+                .order_by(TaskActivityEntity.timestamp.desc(), TaskActivityEntity.id.desc())
+            ).scalars().all()
+
+            ai_decisions = []
+            timeline = []
+
+            for act in activities:
+                a_time = (act.timestamp.replace(tzinfo=timezone.utc) if act.timestamp.tzinfo is None else act.timestamp).isoformat()
+                t_str = (act.timestamp.replace(tzinfo=timezone.utc) if act.timestamp.tzinfo is None else act.timestamp).strftime("%H:%M")
+
+                is_ai = (
+                    "agent" in (act.actor_name or "").lower()
+                    or act.actor_role == "AI_AGENT"
+                    or act.event_type in ("CATEGORY_CLASSIFIED", "SEVERITY_ASSIGNED", "STAFF_ASSIGNED", "TASK_CREATED", "SAFETY_RULE", "ROOM_STATUS_CHANGED")
+                )
+
+                if is_ai and len(ai_decisions) < 8:
+                    ai_decisions.append({
+                        "id": str(act.id),
+                        "time": t_str,
+                        "action": act.title or act.action or act.event_type,
+                        "actor": act.actor_name or "AI Agent",
+                        "result": act.outcome or act.action or "Completed",
+                    })
+
+                is_crit = (
+                    act.event_type in ("TASK_BLOCKED", "TASK_ESCALATED", "HUMAN_OVERRIDE", "SAFETY_RULE")
+                    or "CRITICAL" in (act.outcome or "").upper()
+                    or "CRITICAL" in (act.action or "").upper()
+                )
+                is_sys = "system" in (act.actor_name or "").lower() or act.event_type in ("CHECKOUT_EVENT",)
+
+                timeline.append({
+                    "id": str(act.id),
+                    "time": t_str,
+                    "iso_time": a_time,
+                    "title": act.title or act.action or act.event_type,
+                    "actor": act.actor_name or "System",
+                    "action": act.action,
+                    "result": act.outcome,
+                    "detail": f"{act.actor_name or 'System'} · {act.action or ''} · {act.outcome or ''}".strip(" ·"),
+                    "severity": "critical" if is_crit else ("system" if is_sys else "normal"),
+                })
+
+            return {
+                "id": room_id,
+                "room_number": room_number,
+                "floor": floor,
+                "room_type": room_type,
+                "status": raw_status,
+                "formatted_status": raw_status.replace("_", " ").title(),
+                "priority_score": 85 if raw_status == "OCCUPIED" else 50,
+                "current_guest": current_guest,
+                "upcoming_reservation": upcoming_reservation,
+                "open_tasks": open_tasks,
+                "inspection_task_id": inspection_task_id,
+                "ai_decisions": ai_decisions,
+                "housekeeping_history": housekeeping_history[:6],
+                "maintenance_history": maintenance_history[:6],
+                "timeline": timeline[:30],
+            }
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,46 @@
+[
+  {
+    "Id": 23,
+    "HotelId": 1,
+    "RoomNo": "405",
+    "GuestMessage": "There is a fire",
+    "StaffReply": "",
+    "IsRead": false,
+    "IsReplied": false,
+    "CreatedDate": "2026-10-23T10:52:13.406433+00:00",
+    "RepliedDate": null
+  },
+  {
+    "Id": 24,
+    "HotelId": 1,
+    "RoomNo": "405",
+    "GuestMessage": "I have a problem with my bill",
+    "StaffReply": "",
+    "IsRead": false,
+    "IsReplied": false,
+    "CreatedDate": "2026-10-23T10:53:00.634970+00:00",
+    "RepliedDate": null
+  },
+  {
+    "Id": 37,
+    "HotelId": 1,
+    "RoomNo": "405",
+    "GuestMessage": "I want to check in at 12 PM. Is my room ready?.",
+    "StaffReply": "",
+    "IsRead": false,
+    "IsReplied": false,
+    "CreatedDate": "2026-10-26T10:56:00.562369+00:00",
+    "RepliedDate": null
+  },
+  {
+    "Id": 38,
+    "HotelId": 1,
+    "RoomNo": "405",
+    "GuestMessage": "i need 8 pillows",
+    "StaffReply": "",
+    "IsRead": false,
+    "IsReplied": false,
+    "CreatedDate": "2026-10-27T06:06:31.243901+00:00",
+    "RepliedDate": null
+  }
+]

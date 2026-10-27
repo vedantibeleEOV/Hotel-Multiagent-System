@@ -1,0 +1,53 @@
+[
+  {
+    "TaskItemId": 171,
+    "Department": "FrontDesk",
+    "TaskType": "I want to check in at 12 PM. Is my room ready?",
+    "Status": "Escalated",
+    "HotelId": 1,
+    "RoomNo": "405",
+    "CreatedDate": "2026-10-26T10:29:30.084981+00:00",
+    "Priority": "Medium",
+    "ResolvedDate": null,
+    "AssignedDate": null,
+    "AssignedTo": "",
+    "InProgressDate": null,
+    "Rating": 0,
+    "ExternalIncidentId": null,
+    "ExternalTaskId": null
+  },
+  {
+    "TaskItemId": 172,
+    "Department": "Housekeeping",
+    "TaskType": "I need 2 extra pillows",
+    "Status": "Assigned",
+    "HotelId": 1,
+    "RoomNo": "405",
+    "CreatedDate": "2026-10-26T10:32:16.114011+00:00",
+    "Priority": "Medium",
+    "ResolvedDate": null,
+    "AssignedDate": "2026-10-26T10:32:27.547487+00:00",
+    "AssignedTo": "Priya Deshmukh",
+    "InProgressDate": null,
+    "Rating": 0,
+    "ExternalIncidentId": null,
+    "ExternalTaskId": "6f10e09c-e960-4cdf-80c4-63d4d7d45878"
+  },
+  {
+    "TaskItemId": 170,
+    "Department": "FrontDesk",
+    "TaskType": "There is a fire",
+    "Status": "Escalated",
+    "HotelId": 1,
+    "RoomNo": "405",
+    "CreatedDate": "2026-10-26T10:21:19.015500+00:00",
+    "Priority": "High",
+    "ResolvedDate": null,
+    "AssignedDate": null,
+    "AssignedTo": "",
+    "InProgressDate": null,
+    "Rating": 0,
+    "ExternalIncidentId": null,
+    "ExternalTaskId": null
+  }
+]

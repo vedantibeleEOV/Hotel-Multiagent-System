@@ -1,0 +1,7 @@
+In asset d60fa53d-8825-4b49-bd1b-ae3c84a67dd5:
+l" style={{width}}>{children}</div></div>}
+
+const KIND_C={'AI Agent':'#222222','System':'#929292','Staff':'#2657a0','Supervisor':'#a8430a'};
+function KindTag({k}){return <span className="row g6 small" style={{color:'var(--color-body)',whiteSpace:'nowrap'}}>{k==='AI Agent'?<Icon n="bolt" s={13}/>:<Dot c={KIND_C[k]}/>}{k}</span>}
+function Timeline({e
+

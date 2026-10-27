@@ -1,0 +1,79 @@
+[
+  {
+    "ConversationId": 220,
+    "HotelId": 1,
+    "SessionId": "e5ea0321-99bf-40a5-ba36-6f5afe7637fa",
+    "UserMessage": "I want to check in at 12 PM. Is my room ready?",
+    "BotResponse": "I've passed your early check-in request to our front desk. They will contact you shortly.",
+    "Intent": "SingleRequest",
+    "IsFirstMessage": false,
+    "CreatedDate": "2026-10-26T10:29:30.255351+00:00",
+    "RoomNo": "405"
+  },
+  {
+    "ConversationId": 221,
+    "HotelId": 1,
+    "SessionId": "6ad3591c-82e7-4aee-9479-04d44b141783",
+    "UserMessage": "Can I check in at 12?",
+    "BotResponse": "Your room 406 will be ready for check-in at 12:00. We'll have everything prepared for you.",
+    "Intent": "SingleRequest",
+    "IsFirstMessage": false,
+    "CreatedDate": "2026-10-26T10:30:35.084385+00:00",
+    "RoomNo": "406"
+  },
+  {
+    "ConversationId": 222,
+    "HotelId": 1,
+    "SessionId": "79a8c0ee-3fb8-44fd-9608-7a33f5c288c3",
+    "UserMessage": "I want to check in at 12 PM. Is my room ready?",
+    "BotResponse": "We are already working on this. Our team will assist you shortly.",
+    "Intent": "SingleRequest",
+    "IsFirstMessage": false,
+    "CreatedDate": "2026-10-26T10:31:27.370332+00:00",
+    "RoomNo": "405"
+  },
+  {
+    "ConversationId": 223,
+    "HotelId": 1,
+    "SessionId": "79a8c0ee-3fb8-44fd-9608-7a33f5c288c3",
+    "UserMessage": "What time is check-in?",
+    "BotResponse": "Check-in Time is 2:00 PM.",
+    "Intent": "SingleRequest",
+    "IsFirstMessage": false,
+    "CreatedDate": "2026-10-26T10:31:57.409750+00:00",
+    "RoomNo": "405"
+  },
+  {
+    "ConversationId": 224,
+    "HotelId": 1,
+    "SessionId": "79a8c0ee-3fb8-44fd-9608-7a33f5c288c3",
+    "UserMessage": "I need two extra pillows",
+    "BotResponse": "Your request for 2 pillows has been approved. Our housekeeping team is on the way.",
+    "Intent": "SingleRequest",
+    "IsFirstMessage": false,
+    "CreatedDate": "2026-10-26T10:32:18.264733+00:00",
+    "RoomNo": "405"
+  },
+  {
+    "ConversationId": 214,
+    "HotelId": 1,
+    "SessionId": "bda76fba-f8dd-42fe-afd0-2a4ffbb46eb2",
+    "UserMessage": "Can I check in at 1 pm?",
+    "BotResponse": "Your room 406 will be ready for check-in at 13:00. We'll have everything prepared for you.",
+    "Intent": "SingleRequest",
+    "IsFirstMessage": false,
+    "CreatedDate": "2026-10-26T10:21:13.390396+00:00",
+    "RoomNo": "406"
+  },
+  {
+    "ConversationId": 219,
+    "HotelId": 1,
+    "SessionId": "09e5cd53-7a33-419f-9ea5-97e28d0e5d28",
+    "UserMessage": "There is a fire",
+    "BotResponse": "This sounds urgent. Please call the front desk right now on Dial 0. I have also alerted them.",
+    "Intent": "Emergency",
+    "IsFirstMessage": false,
+    "CreatedDate": "2026-10-26T10:21:19.023352+00:00",
+    "RoomNo": "405"
+  }
+]

@@ -1,0 +1,5 @@
+Id,HotelId,RoomNo,GuestMessage,StaffReply,IsRead,IsReplied,CreatedDate,RepliedDate
+23,1,405,There is a fire,,False,False,2026-10-23T10:52:13.406433+00:00,
+24,1,405,I have a problem with my bill,,False,False,2026-10-23T10:53:00.634970+00:00,
+37,1,405,I want to check in at 12 PM. Is my room ready?.,,False,False,2026-10-26T10:56:00.562369+00:00,
+38,1,405,i need 8 pillows,,False,False,2026-10-27T06:06:31.243901+00:00,

@@ -1,0 +1,13 @@
+Asset 4cb4a2b8-a5f7-471c-baed-456a059e1d33 has Orchestrator at 504:
+il:'“Burning smell from the wall socket near the desk” · Room 305',ts:b-4*MIN},{stage:'orch',title:'Orchestrator',detail:'Issue routed to Maintenance Agent',ts:b-4*MIN+1000},{stage:'mt',title:'Maintenance Agent',detail:'Safety / Electrical · High · 10 min SLA',ts:b-4*MIN+4000},{stage:'rule',title:'Safety rule',detail:'HIGH → CRITICAL · immediate escalation',ts:b-4*MIN+6000},{stage:'task',title:'Ta
+
+Asset bc2cb499-c29c-444d-8bdc-dc018f745ba2 has Orchestrator at 4016:
+,done])=>S.staff[id]={id,name,cat,role,skills,floor,avail,done});
+S.agents={
+ orch:{id:'orch',name:'Orchestrator',desc:'Receives events and routes work to the right agent',processed:412,success:99.8,last:'Routed checkout · Room 116 to Room Readiness',lastTs:T0-40000,current:null},
+ rr:{id:'rr',name:'Room Readiness',desc:'Detects checkouts, sets room status and cleaning urgency',processed:96,succes
+
+Asset d60fa53d-8825-4b49-bd1b-ae3c84a67dd5 has Timeline!
+function Timeline({events,max=40,compact}){if(!events.length)return <Empty icon="list" title="No activity yet" body="Events for this item will appear here."/>;
+ return <div className="tl">{events.slice(0,max).map(e=><div key={e.id} className="tli"><div className="tlt num">{hm(e.ts)}</div><div className="tld" style={{background:e.type==='SLA breached'||e.type==='Safety rule applied'?'#c13515':e.type==='Human override'?'#a8430a':KIND_C[e.kind]}}></div><div className="col" style={{gap:2,minWidth:0}}><div style={{fontWeight:500}}>{e.action}</div><div className="small muted">{e.actor}{e.room&&!comp
+

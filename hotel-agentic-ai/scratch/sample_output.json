@@ -1,0 +1,545 @@
+{
+  "header": {
+    "title": "AI Operations",
+    "subtitle": "4 agents operating normally. Humans supervise and step in on exceptions.",
+    "agents_operating_count": 4,
+    "total_agents": 4,
+    "ai_down": false,
+    "simulate_checkout_room": {
+      "id": 3,
+      "room_number": "101",
+      "reservation_id": 5001
+    }
+  },
+  "agents": [
+    {
+      "id": "orch",
+      "name": "Orchestrator",
+      "description": "Receives events and routes work to the right agent",
+      "status": "Active",
+      "currently": "Listening for events",
+      "last_action": "Routed issue \u00b7 Room 501 to Maintenance Agent",
+      "last_run_at": "2026-10-12T06:34:39.322282+00:00",
+      "active": 0,
+      "processed_today": 3,
+      "success_pct": null
+    },
+    {
+      "id": "rr",
+      "name": "Room Readiness Agent",
+      "description": "Detects checkouts, sets room status and cleaning urgency",
+      "status": "Active",
+      "currently": "Listening for events",
+      "last_action": "OCCUPIED \u2192 DIRTY \u00b7 Room 501 (Priority Low)",
+      "last_run_at": "2026-10-12T06:28:12.621907+00:00",
+      "active": 10,
+      "processed_today": 1,
+      "success_pct": null
+    },
+    {
+      "id": "hk",
+      "name": "Housekeeping Agent",
+      "description": "Matches attendants to rooms and tracks cleaning",
+      "status": "Active",
+      "currently": "Listening for events",
+      "last_action": "Assigned Priya Deshmukh \u00b7 Room 501 (Assigned automatically)",
+      "last_run_at": "2026-10-12T06:28:43.621907+00:00",
+      "active": 0,
+      "processed_today": 2,
+      "success_pct": 100.0
+    },
+    {
+      "id": "mt",
+      "name": "Maintenance Agent",
+      "description": "Classifies issues, sets severity and SLA, finds technicians",
+      "status": "Active",
+      "currently": "Listening for events",
+      "last_action": "Assigned Suresh Pawar \u00b7 Room 501 (ELECTRICAL skill, assigned from Floor 3 (workload: 0 active tasks))",
+      "last_run_at": "2026-10-12T06:34:39.362405+00:00",
+      "active": 0,
+      "processed_today": 2,
+      "success_pct": 100.0
+    }
+  ],
+  "runs": [
+    {
+      "id": "f6ae57c8-cab6-4856-be5b-e8c05b46819e",
+      "type": "issue",
+      "title": "Tv remote is not working",
+      "room_number": "501",
+      "started_at": "2026-10-12T06:34:39.322282+00:00",
+      "status": "ok",
+      "step_count": 8,
+      "steps": [
+        {
+          "kind": "event",
+          "label": "Event",
+          "title": "Issue reported",
+          "detail": "Reported issue in Room 501 \u00b7 Room 501",
+          "time": "2026-10-12T06:34:39.322282+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "orch",
+          "label": "Orchestrator",
+          "title": "Orchestrator",
+          "detail": "Issue routed to Maintenance Agent",
+          "time": "2026-10-12T06:34:39.322282+00:00",
+          "is_derived": true
+        },
+        {
+          "kind": "mt",
+          "label": "Maintenance Agent",
+          "title": "Category classified",
+          "detail": "Category set to ELECTRICAL \u00b7 Issue involves electrical maintenance based on reported details.",
+          "time": "2026-10-12T06:34:39.331699+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "mt",
+          "label": "Maintenance Agent",
+          "title": "Severity assigned",
+          "detail": "Severity set to MEDIUM (60m SLA) \u00b7 Standard electrical repairs default to Medium (60-minute target SLA).",
+          "time": "2026-10-12T06:34:39.341480+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "task",
+          "label": "Task created",
+          "title": "Task created",
+          "detail": "Maintenance task created \u00b7 ELECTRICAL \u00b7 MEDIUM priority",
+          "time": "2026-10-12T06:34:39.352889+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "person",
+          "label": "Assigned to",
+          "title": "Assigned Suresh Pawar",
+          "detail": "ELECTRICAL skill, assigned from Floor 3 (workload: 0 active tasks)",
+          "time": "2026-10-12T06:34:39.362405+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "action",
+          "label": "Amit Shah",
+          "title": "Repair started",
+          "detail": "In progress",
+          "time": "2026-10-12T06:35:19.372861+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "action",
+          "label": "Amit Shah",
+          "title": "Task completed",
+          "detail": "Repair completed",
+          "time": "2026-10-12T06:35:20.357620+00:00",
+          "is_derived": false
+        }
+      ]
+    },
+    {
+      "id": "e9582d49-2a15-4b2c-b980-0b25dec64a6f",
+      "type": "issue",
+      "title": "Geyser is leaking hot water",
+      "room_number": "501",
+      "started_at": "2026-10-12T06:31:31.578548+00:00",
+      "status": "ok",
+      "step_count": 8,
+      "steps": [
+        {
+          "kind": "event",
+          "label": "Event",
+          "title": "Issue reported",
+          "detail": "Reported issue in Room 501 \u00b7 Room 501",
+          "time": "2026-10-12T06:31:31.578548+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "orch",
+          "label": "Orchestrator",
+          "title": "Orchestrator",
+          "detail": "Issue routed to Maintenance Agent",
+          "time": "2026-10-12T06:31:31.578548+00:00",
+          "is_derived": true
+        },
+        {
+          "kind": "mt",
+          "label": "Maintenance Agent",
+          "title": "Category classified",
+          "detail": "Category set to PLUMBING \u00b7 Identified 'leaking' in description, classified as Plumbing.",
+          "time": "2026-10-12T06:31:31.587537+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "mt",
+          "label": "Maintenance Agent",
+          "title": "Severity assigned",
+          "detail": "Severity set to HIGH (30m SLA) \u00b7 Water leak ('leaking') raises plumbing issues to High (30-minute target SLA).",
+          "time": "2026-10-12T06:31:31.597697+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "task",
+          "label": "Task created",
+          "title": "Task created",
+          "detail": "Maintenance task created \u00b7 PLUMBING \u00b7 HIGH priority",
+          "time": "2026-10-12T06:31:31.607818+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "person",
+          "label": "Assigned to",
+          "title": "Assigned Suresh Pawar",
+          "detail": "PLUMBING skill, assigned from Floor 3 (workload: 0 active tasks)",
+          "time": "2026-10-12T06:31:31.618437+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "action",
+          "label": "Suresh Pawar",
+          "title": "Repair started",
+          "detail": "In progress",
+          "time": "2026-10-12T06:33:26.631890+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "action",
+          "label": "Suresh Pawar",
+          "title": "Task completed",
+          "detail": "Repair completed",
+          "time": "2026-10-12T06:33:31.591116+00:00",
+          "is_derived": false
+        }
+      ]
+    },
+    {
+      "id": "800ecbac-0c5e-4880-947b-3445cfd603c0",
+      "type": "checkout",
+      "title": "Guest checked out",
+      "room_number": "501",
+      "started_at": "2026-10-12T06:27:42.621907+00:00",
+      "status": "critical",
+      "step_count": 8,
+      "steps": [
+        {
+          "kind": "event",
+          "label": "Event",
+          "title": "Guest checkout received",
+          "detail": "Guest checked out \u00b7 Room 501",
+          "time": "2026-10-12T06:27:42.621907+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "orch",
+          "label": "Orchestrator",
+          "title": "Orchestrator",
+          "detail": "Checkout event routed to Room Readiness",
+          "time": "2026-10-12T06:27:42.621907+00:00",
+          "is_derived": true
+        },
+        {
+          "kind": "rr",
+          "label": "Room Readiness Agent",
+          "title": "Room Readiness Agent",
+          "detail": "OCCUPIED \u2192 DIRTY \u00b7 Priority Low",
+          "time": "2026-10-12T06:28:12.621907+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "task",
+          "label": "Task created",
+          "title": "Task created",
+          "detail": "Cleaning task created \u00b7 Low priority",
+          "time": "2026-10-12T06:28:42.621907+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "person",
+          "label": "Assigned to",
+          "title": "Assigned Priya Deshmukh",
+          "detail": "Assigned automatically",
+          "time": "2026-10-12T06:28:43.621907+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "rule",
+          "label": "Safety rules",
+          "title": "Task paused",
+          "detail": "Housekeeping paused for maintenance \u00b7 PLUMBING issue affects room readiness and blocks cleaning",
+          "time": "2026-10-12T06:31:31.435282+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "action",
+          "label": "Amit Shah",
+          "title": "Cleaning started",
+          "detail": "In progress",
+          "time": "2026-10-12T06:35:29.260588+00:00",
+          "is_derived": false
+        },
+        {
+          "kind": "action",
+          "label": "Amit Shah",
+          "title": "Task completed",
+          "detail": "Room READY",
+          "time": "2026-10-12T06:35:30.425617+00:00",
+          "is_derived": false
+        }
+      ]
+    }
+  ],
+  "feed": [
+    {
+      "id": "03c681ed-9f1e-4aa4-84f2-c671a82f7c62",
+      "time": "2026-10-12T06:35:30.425617+00:00",
+      "time_formatted": "06:35",
+      "agent": "Staff",
+      "actor": "Amit Shah",
+      "actor_role": "Manager",
+      "room_number": "501",
+      "title": "Task completed",
+      "detail": "Staff \u00b7 Room 501 \u00b7 Completed by Amit Shah \u00b7 Room READY",
+      "severity": "normal"
+    },
+    {
+      "id": "c0ea96ed-1436-4de5-bc1f-0e0e2ddd554c",
+      "time": "2026-10-12T06:35:29.260588+00:00",
+      "time_formatted": "06:35",
+      "agent": "Staff",
+      "actor": "Amit Shah",
+      "actor_role": "Manager",
+      "room_number": "501",
+      "title": "Cleaning started",
+      "detail": "Staff \u00b7 Room 501 \u00b7 Started by Amit Shah \u00b7 In progress",
+      "severity": "normal"
+    },
+    {
+      "id": "6816249e-acad-469e-949d-3ed3eba2cf01",
+      "time": "2026-10-12T06:35:20.357620+00:00",
+      "time_formatted": "06:35",
+      "agent": "Staff",
+      "actor": "Amit Shah",
+      "actor_role": "Manager",
+      "room_number": "501",
+      "title": "Task completed",
+      "detail": "Staff \u00b7 Room 501 \u00b7 Completed by Amit Shah \u00b7 Repair completed",
+      "severity": "normal"
+    },
+    {
+      "id": "a7e0c73e-74e2-4cd7-b6cd-3b97f7da814d",
+      "time": "2026-10-12T06:35:19.372861+00:00",
+      "time_formatted": "06:35",
+      "agent": "Staff",
+      "actor": "Amit Shah",
+      "actor_role": "Manager",
+      "room_number": "501",
+      "title": "Repair started",
+      "detail": "Staff \u00b7 Room 501 \u00b7 Started by Amit Shah \u00b7 In progress",
+      "severity": "normal"
+    },
+    {
+      "id": "4ae798aa-ce71-48d4-86c3-7d6b65c67044",
+      "time": "2026-10-12T06:34:39.362405+00:00",
+      "time_formatted": "06:34",
+      "agent": "Maintenance",
+      "actor": "Maintenance Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Technician assigned",
+      "detail": "Maintenance \u00b7 Room 501 \u00b7 Assigned Suresh Pawar \u00b7 ELECTRICAL skill, assigned from Floor 3 (workload: 0 active tasks)",
+      "severity": "normal"
+    },
+    {
+      "id": "3c07bdf3-87c7-497a-9ad9-e05dc65170ab",
+      "time": "2026-10-12T06:34:39.352889+00:00",
+      "time_formatted": "06:34",
+      "agent": "Maintenance",
+      "actor": "Maintenance Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Task created",
+      "detail": "Maintenance \u00b7 Room 501 \u00b7 Maintenance task created \u00b7 ELECTRICAL \u00b7 MEDIUM priority",
+      "severity": "normal"
+    },
+    {
+      "id": "ce63c776-4b9b-433b-8467-746121ee9d33",
+      "time": "2026-10-12T06:34:39.341480+00:00",
+      "time_formatted": "06:34",
+      "agent": "Maintenance",
+      "actor": "Maintenance Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Severity assigned",
+      "detail": "Maintenance \u00b7 Room 501 \u00b7 Severity set to MEDIUM (60m SLA) \u00b7 Standard electrical repairs default to Medium (60-minute target SLA).",
+      "severity": "normal"
+    },
+    {
+      "id": "3172e9c7-3d12-439c-82a9-1df935125ee5",
+      "time": "2026-10-12T06:34:39.331699+00:00",
+      "time_formatted": "06:34",
+      "agent": "Maintenance",
+      "actor": "Maintenance Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Category classified",
+      "detail": "Maintenance \u00b7 Room 501 \u00b7 Category set to ELECTRICAL \u00b7 Issue involves electrical maintenance based on reported details.",
+      "severity": "normal"
+    },
+    {
+      "id": "0afbce30-d951-43ce-a20f-89d427ca5b3d",
+      "time": "2026-10-12T06:34:39.322282+00:00",
+      "time_formatted": "06:34",
+      "agent": "Staff",
+      "actor": "Priya Deshmukh",
+      "actor_role": "Housekeeping",
+      "room_number": "501",
+      "title": "Issue reported",
+      "detail": "Staff \u00b7 Room 501 \u00b7 Reported issue in Room 501 \u00b7 \"Tv remote is not working\"",
+      "severity": "normal"
+    },
+    {
+      "id": "4a770117-b872-443a-b93d-96285bea8f1b",
+      "time": "2026-10-12T06:33:31.591116+00:00",
+      "time_formatted": "06:33",
+      "agent": "Staff",
+      "actor": "Suresh Pawar",
+      "actor_role": "Maintenance",
+      "room_number": "501",
+      "title": "Task completed",
+      "detail": "Staff \u00b7 Room 501 \u00b7 Completed by Suresh Pawar \u00b7 Repair completed",
+      "severity": "normal"
+    },
+    {
+      "id": "204b5aa3-54a0-44c1-9cf7-589e22dc3d93",
+      "time": "2026-10-12T06:33:26.631890+00:00",
+      "time_formatted": "06:33",
+      "agent": "Staff",
+      "actor": "Suresh Pawar",
+      "actor_role": "Maintenance",
+      "room_number": "501",
+      "title": "Repair started",
+      "detail": "Staff \u00b7 Room 501 \u00b7 Started by Suresh Pawar \u00b7 In progress",
+      "severity": "normal"
+    },
+    {
+      "id": "9cf00870-74ad-4173-8675-d217475337bd",
+      "time": "2026-10-12T06:31:31.618437+00:00",
+      "time_formatted": "06:31",
+      "agent": "Maintenance",
+      "actor": "Maintenance Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Technician assigned",
+      "detail": "Maintenance \u00b7 Room 501 \u00b7 Assigned Suresh Pawar \u00b7 PLUMBING skill, assigned from Floor 3 (workload: 0 active tasks)",
+      "severity": "normal"
+    },
+    {
+      "id": "24801f65-cf32-4f9e-992e-d07f5fda226c",
+      "time": "2026-10-12T06:31:31.607818+00:00",
+      "time_formatted": "06:31",
+      "agent": "Maintenance",
+      "actor": "Maintenance Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Task created",
+      "detail": "Maintenance \u00b7 Room 501 \u00b7 Maintenance task created \u00b7 PLUMBING \u00b7 HIGH priority",
+      "severity": "normal"
+    },
+    {
+      "id": "ea2cb0be-664e-4d5e-86f7-a098f49f9ffa",
+      "time": "2026-10-12T06:31:31.597697+00:00",
+      "time_formatted": "06:31",
+      "agent": "Maintenance",
+      "actor": "Maintenance Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Severity assigned",
+      "detail": "Maintenance \u00b7 Room 501 \u00b7 Severity set to HIGH (30m SLA) \u00b7 Water leak ('leaking') raises plumbing issues to High (30-minute target SLA).",
+      "severity": "normal"
+    },
+    {
+      "id": "81800982-a759-4dd3-bf96-3de69934fbc1",
+      "time": "2026-10-12T06:31:31.587537+00:00",
+      "time_formatted": "06:31",
+      "agent": "Maintenance",
+      "actor": "Maintenance Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Category classified",
+      "detail": "Maintenance \u00b7 Room 501 \u00b7 Category set to PLUMBING \u00b7 Identified 'leaking' in description, classified as Plumbing.",
+      "severity": "normal"
+    },
+    {
+      "id": "8d838740-8de4-4fc3-9b5f-ab3c14f8e788",
+      "time": "2026-10-12T06:31:31.578548+00:00",
+      "time_formatted": "06:31",
+      "agent": "Staff",
+      "actor": "Priya Deshmukh",
+      "actor_role": "Housekeeping",
+      "room_number": "501",
+      "title": "Issue reported",
+      "detail": "Staff \u00b7 Room 501 \u00b7 Reported issue in Room 501 \u00b7 \"Geyser is leaking hot water\"",
+      "severity": "normal"
+    },
+    {
+      "id": "abdd82e6-f584-489b-9b4e-446f1a5c7cf8",
+      "time": "2026-10-12T06:31:31.435282+00:00",
+      "time_formatted": "06:31",
+      "agent": "Maintenance",
+      "actor": "Maintenance Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Task blocked",
+      "detail": "Maintenance \u00b7 Room 501 \u00b7 Housekeeping paused for maintenance \u00b7 PLUMBING issue affects room readiness and blocks cleaning",
+      "severity": "critical"
+    },
+    {
+      "id": "e025864d-8261-491c-a897-4a215e857213",
+      "time": "2026-10-12T06:28:43.621907+00:00",
+      "time_formatted": "06:28",
+      "agent": "Housekeeping",
+      "actor": "Housekeeping Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Cleaner assigned",
+      "detail": "Housekeeping \u00b7 Room 501 \u00b7 Assigned Priya Deshmukh \u00b7 Assigned automatically",
+      "severity": "normal"
+    },
+    {
+      "id": "f2b077fc-5231-455e-94d4-ff0bb3522804",
+      "time": "2026-10-12T06:28:42.621907+00:00",
+      "time_formatted": "06:28",
+      "agent": "Housekeeping",
+      "actor": "Housekeeping Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Task created",
+      "detail": "Housekeeping \u00b7 Room 501 \u00b7 Cleaning task created \u00b7 Low priority",
+      "severity": "normal"
+    },
+    {
+      "id": "8ada0907-26d2-4753-9a73-3d8e7cec134c",
+      "time": "2026-10-12T06:28:12.621907+00:00",
+      "time_formatted": "06:28",
+      "agent": "Room Readiness",
+      "actor": "Room Readiness Agent",
+      "actor_role": "Ai Agent",
+      "room_number": "501",
+      "title": "Room status changed",
+      "detail": "Room Readiness \u00b7 Room 501 \u00b7 OCCUPIED \u2192 DIRTY \u00b7 Priority Low",
+      "severity": "normal"
+    },
+    {
+      "id": "07406723-257f-432a-9f7f-d230d69e4dc4",
+      "time": "2026-10-12T06:27:42.621907+00:00",
+      "time_formatted": "06:27",
+      "agent": "System",
+      "actor": "PMS",
+      "actor_role": "System",
+      "room_number": "501",
+      "title": "Guest checkout received",
+      "detail": "System \u00b7 Room 501 \u00b7 Guest checked out \u00b7 Event queued",
+      "severity": "system"
+    }
+  ]
+}

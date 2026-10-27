@@ -1,0 +1,10 @@
+ConversationId,HotelId,SessionId,UserMessage,BotResponse,Intent,IsFirstMessage,CreatedDate,RoomNo
+229,1,dc27e816-62ac-48c2-a77a-382a630c91fc,i need 8 pillows,"Your request for 8 pillows is more than we can provide as a complimentary item, so I have passed it to our front desk. They will contact you shortly.",SingleRequest,False,2026-10-27T06:06:31.355803+00:00,405
+180,1,218e154e-5f1e-439b-b6b1-0a5e5d43209a,There is a fire,This sounds urgent. Please call the front desk right now on Dial 0. I have also alerted them.,Emergency,False,2026-10-23T10:52:13.418936+00:00,405
+181,1,218e154e-5f1e-439b-b6b1-0a5e5d43209a,I have a problem with my bill,I've passed your request to our front desk. They will contact you shortly.,SingleRequest,False,2026-10-23T10:53:00.643789+00:00,405
+230,1,901f47a5-4aad-462f-adf3-abca4ac64508,Can I check in at 12?,Your room 406 will be ready for check-in at 12:00. We'll have everything prepared for you.,SingleRequest,False,2026-10-27T06:14:56.237374+00:00,406
+231,1,901f47a5-4aad-462f-adf3-abca4ac64508,i need two extra pillows,Your request for 2 pillows has been approved. Our housekeeping team is on the way.,SingleRequest,False,2026-10-27T06:16:01.821756+00:00,406
+225,1,510d6f1d-aab0-45a7-a645-d04416ece594,Can I check in at 12?,Your room 406 will be ready for check-in at 12:00. We'll have everything prepared for you.,SingleRequest,False,2026-10-26T10:54:09.055199+00:00,406
+226,1,510d6f1d-aab0-45a7-a645-d04416ece594,I want to check in at 12 PM. Is my room ready?,Your room 406 will be ready for check-in at 12:00. We'll have everything prepared for you.,SingleRequest,False,2026-10-26T10:54:45.913414+00:00,406
+227,1,44fb6483-2c34-4c78-bac1-aecc47c76ad7,I want to check in at 12 PM. Is my room ready?.,I've passed your early check-in request to our front desk. They will contact you shortly.,SingleRequest,False,2026-10-26T10:56:00.608577+00:00,405
+228,1,3a542671-4577-4798-b9c3-e3b29620071f,Can I check in at 1 pm?.,Your room 406 will be ready for check-in at 13:00. We'll have everything prepared for you.,SingleRequest,False,2026-10-26T10:56:53.896022+00:00,406

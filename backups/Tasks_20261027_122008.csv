@@ -1,0 +1,7 @@
+TaskItemId,Department,TaskType,Status,HotelId,RoomNo,CreatedDate,Priority,ResolvedDate,AssignedDate,AssignedTo,InProgressDate,Rating,ExternalIncidentId,ExternalTaskId
+172,Housekeeping,I need 2 extra pillows,Assigned,1,405,2026-10-26T10:32:16.114011+00:00,Medium,,2026-10-26T10:32:27.547487+00:00,Priya Deshmukh,,0,,
+174,Housekeeping,i need 8 pillows,Escalated,1,405,2026-10-27T06:06:28.922149+00:00,Medium,,,,,0,,
+148,FrontDesk,There is a fire,Escalated,1,405,2026-10-23T10:52:13.405977+00:00,High,,,,,0,,
+149,FrontDesk,I have a problem with my bill,Escalated,1,405,2026-10-23T10:53:00.634650+00:00,Medium,,,,,0,,
+175,Housekeeping,i need 2 extra pillows,Assigned,1,406,2026-10-27T06:15:59.464051+00:00,Medium,,2026-10-27T06:16:05.457549+00:00,Priya Deshmukh,,0,,
+173,FrontDesk,I want to check in at 12 PM. Is my room ready?.,Escalated,1,405,2026-10-26T10:56:00.561371+00:00,Medium,,,,,0,,
